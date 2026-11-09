@@ -1,9 +1,12 @@
 // Pure helpers of the pi-subagent mod: no `$`, so the tests reach every branch.
 
-// Agent types that only look around: pi gets read-only tools and is told so.
+// Agent types that only look around: the backend gets read-only tools or a read-only sandbox, and is told so.
 export const READ_ONLY_TYPES = new Set(['explore', 'plan', 'claude-code-guide'])
 export const READ_ONLY_NOTE =
   'You are in read-only mode: you have only read, grep, find and ls. Inspect and report; do not try to change anything.'
+// For backends that cannot be limited to a fixed tool set: the note says what the sandbox or permission mode enforces anyway.
+export const READ_ONLY_NOTE_ANY =
+  'You are in read-only mode: inspect and report only. Do not create, modify or delete files, and do not run commands that change anything.'
 
 export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
@@ -25,7 +28,7 @@ export type Activity = { seq: number; at: number; kind: ActivityKind; summary: s
 
 export type Usage = { input: number; output: number; cacheRead: number; cacheWrite: number }
 
-// What one pi run (a launch or a resume) came to.
+// What one run of a backend (a launch or a resume) came to.
 export type RunStats = {
   steps: number
   usage: Usage
@@ -34,6 +37,10 @@ export type RunStats = {
   error?: string
   settled: boolean
   aborted: boolean
+  // The backend's own id for the conversation, once it has said it: what a resume continues.
+  session?: string
+  // What the backend refused to do for lack of permission.
+  denied: string[]
 }
 
 export type PiEvent = {
@@ -47,9 +54,11 @@ export const newStats = (): RunStats => ({
   answer: '',
   settled: false,
   aborted: false,
+  denied: [],
 })
 
-// Splits `Explore@codebuddy/glm-5.3:high` into the agent type and pi's model pattern.
+// Splits `Explore@codebuddy/glm-5.3:high` into the agent type and what follows the `@`:
+// a pi model pattern, or a backend (`codex/gpt-5.5:high`).
 export function splitType(subagentType?: string): { type: string; model?: string } {
   const at = subagentType?.indexOf('@') ?? -1
   if (!subagentType || at < 0) return { type: subagentType || 'general-purpose' }
@@ -58,16 +67,40 @@ export function splitType(subagentType?: string): { type: string; model?: string
 
 export const isReadOnlyType = (type: string) => READ_ONLY_TYPES.has(type.toLowerCase())
 
-// Starts pi in RPC mode reading its commands from `cmdFile` as lines are appended.
-// `exec` keeps the shell's pid for pi, so `tail --pid` ends with pi, and the pid
-// on stderr is what a stop kills. While that pid lives a beat line goes to stderr
-// every BEAT_EVERY_S: pi is silent for as long as one command runs, and a stderr
-// line is what lets the agent's model request show the engine it is still working.
+// What a backend's CLI reads on stdin, set up by the wrapper below:
+//  - feed: the lines of `file`, as they are appended (pi's RPC commands, steering included);
+//  - file: `file` once, then end of input (a prompt the CLI reads from stdin);
+//  - none: nothing (the prompt is on the command line).
+export type StdinMode = 'feed' | 'file' | 'none'
+
+// Starts a backend's CLI under bash. `exec` keeps the shell's pid for the CLI, and that
+// pid on stderr is what a stop kills. While it lives a beat line goes to stderr every
+// BEAT_EVERY_S: a CLI is silent for as long as one command runs, and a stderr line is
+// what lets the agent's model request show the engine it is still working. The CLI is
+// told it runs inside a subagent (PI_SUBAGENT_NESTED), so a Claude Code started this
+// way does not hand its own subagents to this mod again.
 export const BEAT_EVERY_S = 20
+
+// The feed mode's reader, in plain bash 3.2 (macOS's) with no `tail --pid`, which BSD tail
+// lacks. A descriptor on the file is read to its end, again every 0.2 s until the CLI's
+// pid is gone; a line still being written is held back until its newline arrives.
+const FEEDER =
+  'exec 3< "$f"; b=; while :; do while IFS= read -r -u 3 l; do printf "%s%s\\n" "$b" "$l"; b=; done; b=$b$l; l=; kill -0 $$ 2>/dev/null || break; sleep 0.2; done'
+
 const WRAPPER =
-  'f="$1"; shift; echo "PI_PID $$" >&2; ' +
+  'mode="$1"; f="$2"; shift 2; export PI_SUBAGENT_NESTED=1; echo "PI_PID $$" >&2; ' +
   `(n=0; while kill -0 $$ 2>/dev/null; do sleep 1; n=$((n+1)); if [ $((n % ${BEAT_EVERY_S})) -eq 0 ]; then echo PI_BEAT >&2; fi; done) >/dev/null & ` +
-  'exec "$@" < <(exec tail -n +1 -f --pid=$$ "$f")'
+  `case "$mode" in feed) exec "$@" < <(${FEEDER});; file) exec "$@" < "$f";; *) exec "$@" < /dev/null;; esac`
+
+export const wrapArgv = (stdin: StdinMode, file: string, cli: readonly string[]): string[] => [
+  'bash',
+  '-c',
+  WRAPPER,
+  'pi-subagent',
+  stdin,
+  file,
+  ...cli,
+]
 
 export type PiRun = {
   cmdFile: string
@@ -77,20 +110,23 @@ export type PiRun = {
   thinking?: string
 }
 
-export function piArgv({ cmdFile, session, readOnly, model, thinking }: PiRun): string[] {
-  const argv = ['bash', '-c', WRAPPER, 'pi-subagent', cmdFile, 'pi', '--mode', 'rpc', ...session]
+// pi in RPC mode: it reads its commands from the command file as lines are appended.
+export function piCli({ session, readOnly, model, thinking }: Omit<PiRun, 'cmdFile'>): string[] {
+  const argv = ['pi', '--mode', 'rpc', ...session]
   if (model) argv.push('--model', model)
   if (thinking) argv.push('--thinking', thinking)
   if (readOnly) argv.push('--tools', 'read,grep,find,ls', '--append-system-prompt', READ_ONLY_NOTE)
   return argv
 }
 
+export const piArgv = (run: PiRun): string[] => wrapArgv('feed', run.cmdFile, piCli(run))
+
 // Kills a process and every descendant, collected before any dies so none is reparented away.
 export const KILL_TREE =
   'tree() { echo "$1"; for c in $(pgrep -P "$1"); do tree "$c"; done; }; kill $(tree "$1") 2>/dev/null; true'
 
-// pi's stderr less the wrapper's pid and beat lines and the new-session warning.
-export function piStderr(stderr: string) {
+// A backend's stderr less the wrapper's pid and beat lines and pi's new-session warning.
+export function cleanStderr(stderr: string) {
   return stderr
     .split('\n')
     .filter(l => !/^PI_PID \d+/.test(l) && l !== 'PI_BEAT' && !/^Warning: No project session found/.test(l))
@@ -132,10 +168,10 @@ export function findAgentWorktree(list: readonly Worktree[], agentId: string): {
 }
 
 // What to do about a missing worktree: on a resume the engine has most likely removed it.
-export const missingWorktreeAdvice = (resumed: boolean) =>
+export const missingWorktreeAdvice = (resumed: boolean, label = 'pi') =>
   resumed
     ? 'The engine removes a worktree with no changes when the agent finishes, so start a new agent instead of resuming this one.'
-    : 'pi runs only in the worktree the engine made for this agent, never in another checkout; start the agent again.'
+    : `${label} runs only in the worktree the engine made for this agent, never in another checkout; start the agent again.`
 
 export type WorktreeBrief = {
   path: string
@@ -181,9 +217,10 @@ export function clip(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`
 }
 
-const cut = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`)
+export const cut = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`)
 
-function textOf(content: unknown): string {
+// The text of a message's content: a string as it is, or a list's text blocks joined.
+export function textOf(content: unknown): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
   return content
@@ -379,10 +416,12 @@ export function resolveAgent<T extends { id: string; name?: string }>(agents: It
   const all = [...agents]
   const exact = all.find(a => a.id === ref) ?? all.find(a => a.name === ref)
   if (exact) return { agent: exact }
-  if (ref.length < 8) return { error: `No pi subagent is named or numbered "${ref}".` }
+  if (ref.length < 8) return { error: `No subagent run by this plugin is named or numbered "${ref}".` }
   const matches = all.filter(a => a.id.startsWith(ref))
   if (matches.length === 1) return { agent: matches[0] }
-  return { error: matches.length ? `"${ref}" matches ${matches.length} pi subagents.` : `No pi subagent is named or numbered "${ref}".` }
+  return {
+    error: matches.length ? `"${ref}" matches ${matches.length} subagents.` : `No subagent run by this plugin is named or numbered "${ref}".`,
+  }
 }
 
 export const totalTokens = (u: Usage) => u.input + u.output + u.cacheRead + u.cacheWrite

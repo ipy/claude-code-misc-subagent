@@ -1,11 +1,13 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { DETECT_SCRIPT } from './backends'
+import { READ_ONLY_NOTE_ANY } from './core'
 
 // The test runtime has timers; the module's own types do not declare them.
 declare const setTimeout: (fn: (v?: unknown) => void, ms: number) => unknown
 
-// The engine and the host beneath the plugin: a fake pi, a fake git, pi's settings,
-// and an Agent tool that spawns the way the engine does.
+// The engine and the host beneath the plugin: a fake pi (and a scripted stand-in for each other
+// coding agent), a fake git, pi's settings, and an Agent tool that spawns the way the engine does.
 
 const HOME = '/home/t'
 const SETTINGS = JSON.stringify({
@@ -21,8 +23,13 @@ openrouter   openai/gpt-6-sol                   1.1M     128K     yes       yes
 `
 
 // `beats`: PI_BEAT lines the wrapper prints while a tool runs; `earlyBeats`: before pi has started one;
-// `lostEnd`: the tool's end event never comes, its turn ends, and `lateBeats` follow.
-type PiScript = { answer?: string; fail?: string; gate?: Promise<void>; beats?: number; earlyBeats?: number; lostEnd?: boolean; lateBeats?: number }
+// `lostEnd`: the tool's end event never comes, its turn ends, and `lateBeats` follow;
+// `noSettle`: pi exits cleanly after its last message, without the event that says it is settled.
+type PiScript = { answer?: string; fail?: string; gate?: Promise<void>; beats?: number; earlyBeats?: number; lostEnd?: boolean; lateBeats?: number; noSettle?: boolean }
+
+type Chunk = { stream: 'stdout' | 'stderr'; text: string }
+// What a CLI other than pi prints, in order; a promise in the list holds the run until it settles.
+type CliScript = (Chunk | Promise<unknown>)[] | ((argv: readonly string[]) => (Chunk | Promise<unknown>)[])
 
 // The repo the fake git answers for: the session's checkout and the engine's worktree of agent a1.
 type Git = { sessionHead: string; worktreeHead: string; dirty: boolean; resetFails: boolean; worktrees: boolean }
@@ -44,6 +51,19 @@ type World = {
   listGate?: Promise<void>
   agentCalls: (Record<string, unknown> & { done?: () => void })[]
   pi: PiScript
+  // The executables `command -v` finds: pi, claude, codex, codebuddy, agy, opencode.
+  installed: Set<string>
+  // What each other CLI prints when it is started, by executable name, and the code it exits with.
+  cli: Record<string, CliScript>
+  cliCode: number
+  toasts: string[]
+  // The tools the plugin registered at session start.
+  registered: string[]
+  // What the status line said, in order; undefined when it was cleared.
+  statuses: (string | undefined)[]
+  // The plugin's key-value store, as the tests may read it.
+  store: Map<string, unknown>
+  clock: ReturnType<typeof mock.clock>
 }
 
 // pi's settings file as the fake host answers it; a test may change it mid-session.
@@ -51,7 +71,7 @@ let settings = SETTINGS
 
 const ok = (stdout = '', exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
-function world(on: On, stored?: Record<string, unknown>): World {
+function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<string, string>; installed?: string[] } = {}): World {
   const w: World = {
     root: '/repo',
     cwd: '/repo',
@@ -65,15 +85,39 @@ function world(on: On, stored?: Record<string, unknown>): World {
     spawned: [],
     agentCalls: [],
     pi: {},
+    installed: new Set(opts.installed ?? ['pi']),
+    cli: {},
+    cliCode: 0,
+    toasts: [],
+    registered: [],
+    statuses: [],
+    store: new Map(Object.entries(stored ?? {})),
+    clock: mock.clock(on),
   }
   const sessionFiles = new Set<string>()
   let agents = 0
-  mock.env(on, { HOME })
-  mock.store(on, stored)
+  mock.env(on, { HOME, ...opts.env })
+  on('store.get', ($, e) => ({ value: w.store.get((e as unknown as { key: string }).key) }) as never)
+  on('store.set', ($, e) => {
+    const { key, value } = e as unknown as { key: string; value: unknown }
+    w.store.set(key, value)
+    return { value: undefined } as never
+  })
 
   on('session.root', () => ({ value: w.root }))
-  on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', ($, e) => {
+    w.statuses.push((e as unknown as { text?: string }).text)
+    return { value: undefined }
+  })
+  on('ui.toast', ($, e) => {
+    w.toasts.push((e as unknown as { text: string }).text)
+    return { value: undefined }
+  })
+  on('tool.register', ($, e) => {
+    w.registered.push((e as unknown as { name: string }).name)
+    return { value: undefined }
+  })
+  on('session.start', () => ({ cwd: '/repo' }) as never)
   on('ui.log', () => ({ value: undefined }))
   on('fs.exists', ($, e) => ({ value: e.path === `${HOME}/.pi/agent/settings.json` }))
   settings = SETTINGS
@@ -87,6 +131,9 @@ function world(on: On, stored?: Record<string, unknown>): World {
     w.runs.push(e.argv)
     const [cmd, ...rest] = e.argv
     if (cmd === 'pwd') return ok(`${w.cwd}\n`)
+    if (cmd === 'bash' && rest[0] === '-c' && rest[1] === DETECT_SCRIPT) {
+      return ok(rest.slice(3).filter(name => w.installed.has(name)).map(name => `${name}\t/usr/local/bin/${name}\n`).join(''))
+    }
     if (cmd === 'pi' && rest[0] === '--list-models') {
       await w.listGate
       return ok(MODELS)
@@ -119,6 +166,16 @@ function world(on: On, stored?: Record<string, unknown>): World {
   })
   on('process.spawn', async function* ($, e) {
     w.spawns.push({ argv: e.argv, cwd: e.cwd })
+    // The wrapper's arguments end at the CLI's own: bash -c <script> pi-subagent <mode> <file> <cli...>.
+    const script = w.cli[e.argv[6] ?? '']
+    if (script) {
+      yield { stream: 'stderr' as const, text: 'PI_PID 4242\n' }
+      for (const part of typeof script === 'function' ? script(e.argv) : script) {
+        if (part instanceof Promise) await part
+        else yield part
+      }
+      return { value: { code: w.cliCode, signal: null } }
+    }
     const id = e.argv[e.argv.indexOf('--session-id') + 1]
     if (e.argv.includes('--session-id') && id) sessionFiles.add(`2026-01-01_${id}.jsonl`)
     yield { stream: 'stderr' as const, text: 'PI_PID 4242\n' }
@@ -143,7 +200,7 @@ function world(on: On, stored?: Record<string, unknown>): World {
       type: 'message_end',
       message: { role: 'assistant', provider: 'p', model: 'm', stopReason: 'stop', content: [{ type: 'text', text: w.pi.answer ?? 'pi says hi' }], usage: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } },
     })
-    yield line({ type: 'agent_settled', aborted: false })
+    if (!w.pi.noSettle) yield line({ type: 'agent_settled', aborted: false })
     return { value: { code: 0, signal: null } }
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -242,7 +299,7 @@ test('describe lists the scoped models with the default marked', async ($, on) =
 
 test('a slow pi --list-models: describe names the scoped models, then adds their facts', async ($, on) => {
   const w = world(on)
-  const clock = mock.clock(on)
+  const clock = w.clock
   let release = () => {}
   w.listGate = new Promise<void>(r => (release = r))
   const describe = () => $.tool.describe({ tool: 'Agent', description: 'BASE', provider: { plugin: 'engine', tier: 'core' } } as never)
@@ -669,7 +726,7 @@ test('SendMessage steers a working agent; otherwise the engine delivers', async 
 
 test('activity lists and pages; watch notices wake an idle session and ride the next tool result of a busy turn', async ($, on) => {
   const w = world(on)
-  const clock = mock.clock(on)
+  const clock = w.clock
   const session = mock.session(on)
   let release = () => {}
   w.pi.gate = new Promise<void>(r => (release = r))
@@ -728,3 +785,591 @@ async function mainToolResult($: any, text: string) {
     uuid: `u-${text}`,
   } as never)
 }
+
+// ---- the other coding agents ------------------------------------------------------------------
+//
+// Each is a scripted stand-in for the real CLI: the lines it printed in a real run, in the order it printed them.
+
+const out = (ev: object): Chunk => ({ stream: 'stdout', text: JSON.stringify(ev) + '\n' })
+const err = (text: string): Chunk => ({ stream: 'stderr', text })
+
+// The wrapper's arguments: bash -c <script> pi-subagent <mode> <file> <cli...>.
+const modeOf = (argv: readonly string[]) => argv[4]
+const fileOf = (argv: readonly string[]) => argv[5]
+const cliOf = (argv: readonly string[]) => argv.slice(6)
+const flag = (argv: readonly string[], name: string) => cliOf(argv).find(a => a.startsWith(`${name}=`))?.slice(name.length + 1)
+
+const claudeRun = (answer = 'claude says hi', session = 'sess-claude-1'): CliScript => [
+  out({ type: 'system', subtype: 'init', session_id: session, model: 'claude-opus-5-5' }),
+  out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } }),
+  out({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'a.txt', is_error: false }] } }),
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: answer }] } }),
+  out({
+    type: 'result', subtype: 'success', is_error: false, result: answer, permission_denials: [],
+    modelUsage: { 'claude-opus-5-5': { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 5, cacheCreationInputTokens: 0 } },
+  }),
+]
+
+const codexRun = (answer = 'codex says hi', thread = 'thread-codex-1', hold?: Promise<unknown>): CliScript => [
+  out({ type: 'thread.started', thread_id: thread }),
+  out({ type: 'item.started', item: { id: 'i1', type: 'command_execution', command: '/bin/zsh -lc ls', aggregated_output: '', exit_code: null, status: 'in_progress' } }),
+  out({ type: 'item.completed', item: { id: 'i1', type: 'command_execution', command: '/bin/zsh -lc ls', aggregated_output: 'a.txt\n', exit_code: 0, status: 'completed' } }),
+  out({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: answer } }),
+  out({ type: 'turn.completed', usage: { input_tokens: 105, cached_input_tokens: 5, output_tokens: 20 } }),
+  ...(hold ? [hold] : []),
+]
+
+const agyRun = (answer = 'agy says hi', conversation = 'conv-agy-1'): CliScript => [
+  out({ event: 'init', conversation_id: conversation }),
+  out({ event: 'step_update', step_update: { step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'list_dir', tool_info: { name: 'list_dir', parameters: { Path: '.' } } } }),
+  out({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'tool', tool_name: 'list_dir', tool_info: { name: 'list_dir', parameters: { Path: '.' }, output: 'a.txt' } } }),
+  out({ event: 'step_update', step_update: { step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: answer, usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 5 } } }),
+  out({ event: 'result', result: { conversation_id: conversation, status: 'SUCCESS', response: answer } }),
+]
+
+const opencodeRun = (answer = 'opencode says hi', session = 'ses_opencode1'): CliScript => [
+  out({ type: 'step_start', sessionID: session, part: {} }),
+  out({ type: 'tool_use', sessionID: session, part: { tool: 'read', state: { status: 'completed', input: { filePath: 'a.txt' }, output: 'one' } } }),
+  out({ type: 'step_finish', sessionID: session, part: { reason: 'tool-calls', tokens: { input: 60, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } } }),
+  out({ type: 'step_start', sessionID: session, part: {} }),
+  out({ type: 'text', sessionID: session, part: { text: answer } }),
+  out({ type: 'step_finish', sessionID: session, part: { reason: 'stop', tokens: { input: 40, output: 15, reasoning: 0, cache: { read: 5, write: 0 } } } }),
+]
+
+const ALL = ['pi', 'claude', 'codex', 'codebuddy', 'agy', 'opencode']
+const describeAgent = ($: any) => $.tool.describe({ tool: 'Agent', description: 'BASE', provider: { plugin: 'engine', tier: 'core' } } as never)
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+// The prompt file of the first agent, and what the plugin wrote into it.
+const promptFileOf = (w: World, id = 'a1') => `${HOME}/.claude/pi-subagent/${id}.prompt.txt`
+
+test('describe names every installed agent, how to ask for it, and where an unmarked call goes', async ($, on) => {
+  world(on, undefined, { installed: ['pi', 'claude', 'codex'] })
+  const d = await describeAgent($)
+  expect(d.description).toContain('`@<agent>[/<model>][:<effort>]`')
+  expect(d.description).toContain('Without an `@`, the agent runs on pi.')
+  expect(d.description).toContain('`@claude-code` · Claude Code')
+  expect(d.description).toContain('`@codex` · Codex CLI')
+  expect(d.description).toContain('Not installed: codebuddy-code, agy, opencode.')
+  expect(d.description).not.toContain('`@agy`')
+  // pi's scoped models are still listed, as pi is here.
+  expect(d.description).toContain('acme/deepseek-ai/DeepSeek-V4.1-Flash (default)')
+  expect(d.description).toContain('`@claude`')
+})
+
+test('without pi the description lists no pi models and an unmarked call goes to Claude', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  const d = await describeAgent($)
+  expect(d.description).toContain('Without an `@`, the agent runs on Claude.')
+  expect(d.description).toContain('`@codex` · Codex CLI')
+  expect(d.description).not.toContain('acme/deepseek')
+  expect(d.description).not.toContain('`@pi`')
+  await launch($, w, { subagent_type: 'general-purpose' })
+  await step($, 'a1')
+  expect(w.claudeSteps).toBe(1)
+  expect(w.spawns.length).toBe(0)
+})
+
+test('claude: its CLI runs headless in the agent\'s directory, its prompt in a private file that is removed after', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'] })
+  w.cli.claude = claudeRun()
+  await launch($, w, { subagent_type: 'general-purpose@claude-code/opus:high' })
+  expect(w.agentCalls[0]?.subagent_type).toBe('general-purpose')
+  const { texts, result } = await step($, 'a1')
+  const spawn = w.spawns[0]!
+  expect(modeOf(spawn.argv)).toBe('file')
+  expect(fileOf(spawn.argv)).toBe(promptFileOf(w))
+  expect(cliOf(spawn.argv).slice(0, 4)).toEqual(['claude', '-p', '--output-format=stream-json', '--verbose'])
+  expect(flag(spawn.argv, '--model')).toBe('opus')
+  expect(flag(spawn.argv, '--effort')).toBe('high')
+  expect(cliOf(spawn.argv)).toContain('--dangerously-skip-permissions')
+  expect(cliOf(spawn.argv).join(' ')).not.toContain('do the task')
+  expect(spawn.cwd).toBe('/repo')
+  expect(w.writes.get(promptFileOf(w))).toBe('do the task\n')
+  expect(w.runs).toContainEqual(['mkdir', '-p', '-m', '700', `${HOME}/.claude/pi-subagent`])
+  expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
+  // No pi command file, and the engine's model is never asked.
+  expect([...w.writes.keys()].some(f => f.endsWith('cmd.jsonl'))).toBe(false)
+  expect(w.claudeSteps).toBe(0)
+  expect(texts.join('')).toBe(result.answer)
+  expect(result.answer).toContain('claude says hi')
+  expect(result.answer).toContain('[claude · claude-opus-5-5 · 1 tool uses · 125 tokens: 100 in, 20 out, 5 cache read]')
+  // The engine is told the cost under a name no Claude price list has.
+  expect(result.usage).toMatchObject({ input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 5, model: 'claude-code/claude-opus-5-5' })
+})
+
+test('claude: the session it begins is continued by a resume, in the directory it began in', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'] })
+  w.cli.claude = claudeRun('first', 'sess-claude-1')
+  await launch($, w, { subagent_type: 'general-purpose@claude-code' })
+  await step($, 'a1')
+  expect(cliOf(w.spawns[0]!.argv).some(a => a.startsWith('--resume'))).toBe(false)
+  w.cwd = '/elsewhere'
+  w.cli.claude = claudeRun('second', 'sess-claude-1')
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'text', text: 'and now?' }] },
+    door: 'delivery',
+    origin: { kind: 'tool', tool: 'SendMessage' },
+    uuid: 'r1',
+    agentId: 'a1',
+  } as never)
+  const { result } = await step($, 'a1')
+  const second = w.spawns[1]!
+  expect(flag(second.argv, '--resume')).toBe('sess-claude-1')
+  expect(second.cwd).toBe('/repo')
+  expect(w.writes.get(promptFileOf(w))).toBe('and now?\n')
+  expect(result.answer).toContain('second')
+  const page = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xr', agent_id: 'a1' } as never)
+  expect(JSON.stringify(page)).toContain('resumed its claude session')
+})
+
+test('after a reload an agent resumes its own backend session, with its own permissions', async ($, on) => {
+  const kept = {
+    id: 'a1', type: 'general-purpose', description: 'd', backend: 'codex', policy: 'guarded', model: 'gpt-5.5',
+    readOnly: false, isolated: false, session: 'thread-kept-1', cwd: '/kept/dir',
+  }
+  const w = world(on, { 'agent:a1': kept }, { installed: ['codex'] })
+  w.cli.codex = codexRun('resumed', 'thread-kept-1')
+  const { result } = await step($, 'a1')
+  const argv = cliOf(w.spawns[0]!.argv)
+  expect(argv.slice(0, 3)).toEqual(['codex', 'exec', 'resume'])
+  expect(argv.slice(-2)).toEqual(['thread-kept-1', '-'])
+  expect(argv).toContain('sandbox_mode="workspace-write"')
+  expect(argv).toContain('--model=gpt-5.5')
+  expect(w.spawns[0]!.cwd).toBe('/kept/dir')
+  expect(result.answer).toContain('resumed')
+})
+
+test('an agent kept by a backend this version does not know is left to the engine', async ($, on) => {
+  const w = world(on, { 'agent:a1': { id: 'a1', type: 'general-purpose', description: 'd', backend: 'someday', readOnly: false, isolated: false } })
+  await step($, 'a1')
+  expect(w.claudeSteps).toBe(1)
+  expect(w.spawns.length).toBe(0)
+})
+
+test('an agent kept before there were several backends is pi\'s', async ($, on) => {
+  const w = world(on, { 'agent:a1': { id: 'a1', type: 'general-purpose', description: 'd', readOnly: false, isolated: false } })
+  await step($, 'a1')
+  expect(cliOf(w.spawns[0]!.argv)[0]).toBe('pi')
+  expect(modeOf(w.spawns[0]!.argv)).toBe('feed')
+})
+
+test('codex: read-only types get the read-only sandbox, a model and an effort are options, the prompt leads with the note', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'Explore@codex/gpt-5.5:high' })
+  const { result } = await step($, 'a1')
+  const argv = cliOf(w.spawns[0]!.argv)
+  expect(argv).toContain('sandbox_mode="read-only"')
+  expect(flag(w.spawns[0]!.argv, '--model')).toBe('gpt-5.5')
+  expect(argv).toContain('model_reasoning_effort="high"')
+  expect(argv.at(-1)).toBe('-')
+  expect(w.writes.get(promptFileOf(w))).toBe(`${READ_ONLY_NOTE_ANY}\n\ndo the task\n`)
+  expect(result.answer).toContain('[codex · gpt-5.5 · 1 tool uses')
+  expect(result.usage?.model).toBe('codex/gpt-5.5')
+  // The thread id comes from the CLI's own first event.
+  expect(w.store.get('agent:a1')).toMatchObject({ backend: 'codex', policy: 'bypass', session: 'thread-codex-1', cwd: '/repo', model: 'gpt-5.5' })
+})
+
+test('the effort parameter reaches a backend unless the suffix names one', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'general-purpose@codex', effort: 'low' })
+  await launch($, w, { subagent_type: 'general-purpose@codex:xhigh', effort: 'low' })
+  await launch($, w, { subagent_type: 'general-purpose@codex', effort: 'loud' })
+  await step($, 'a1')
+  await step($, 'a2')
+  await step($, 'a3')
+  expect(cliOf(w.spawns[0]!.argv)).toContain('model_reasoning_effort="low"')
+  expect(cliOf(w.spawns[1]!.argv)).toContain('model_reasoning_effort="xhigh"')
+  expect(cliOf(w.spawns[2]!.argv).some(a => a.startsWith('model_reasoning_effort'))).toBe(false)
+})
+
+test('agy: the prompt is the value of its flag and no file is written; the conversation id is kept', async ($, on) => {
+  const w = world(on, undefined, { installed: ['agy'] })
+  w.cli.agy = agyRun()
+  await launch($, w, { subagent_type: 'general-purpose@agy/Gemini 3.8 Flash (High)' })
+  const { result } = await step($, 'a1')
+  const spawn = w.spawns[0]!
+  expect(modeOf(spawn.argv)).toBe('none')
+  expect(cliOf(spawn.argv)).toEqual([
+    'agy', '--output-format=stream-json', '--model=Gemini 3.8 Flash (High)', '--dangerously-skip-permissions', '--prompt=do the task',
+  ])
+  expect(w.writes.has(promptFileOf(w))).toBe(false)
+  expect(w.runs.some(a => a[0] === 'rm')).toBe(false)
+  expect(result.answer).toContain('agy says hi')
+  expect(result.answer).toContain('[agy · Gemini 3.8 Flash (High) · 1 tool uses · 125 tokens')
+  expect(w.store.get('agent:a1')).toMatchObject({ backend: 'agy', session: 'conv-agy-1' })
+  // The next run carries the conversation.
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'text', text: 'again' }] },
+    door: 'delivery', origin: { kind: 'tool', tool: 'SendMessage' }, uuid: 'r2', agentId: 'a1',
+  } as never)
+  await step($, 'a1')
+  expect(cliOf(w.spawns[1]!.argv)).toContain('--conversation=conv-agy-1')
+})
+
+test('opencode: a prompt that looks like a flag follows "--", and read-only denies commands and edits', async ($, on) => {
+  const w = world(on, undefined, { installed: ['opencode'] })
+  w.cli.opencode = opencodeRun()
+  w.cli.env = opencodeRun('read-only reply')
+  await launch($, w, { subagent_type: 'general-purpose@opencode/ollama/qwen3.5:9b:medium', prompt: '--help me' })
+  await launch($, w, { subagent_type: 'Explore@opencode' })
+  const { result } = await step($, 'a1')
+  const argv = cliOf(w.spawns[0]!.argv)
+  expect(argv).toEqual(['opencode', 'run', '--format=json', '--model=ollama/qwen3.5:9b', '--variant=medium', '--dangerously-skip-permissions', '--', '--help me'])
+  expect(result.answer).toContain('opencode says hi')
+  expect(w.store.get('agent:a1')).toMatchObject({ backend: 'opencode', session: 'ses_opencode1' })
+  await step($, 'a2')
+  const ro = cliOf(w.spawns[1]!.argv)
+  expect(ro.slice(0, 3)).toEqual(['env', 'OPENCODE_PERMISSION={"bash":"deny","edit":"deny"}', 'opencode'])
+  expect(ro).not.toContain('--dangerously-skip-permissions')
+})
+
+test('a prompt too long for a command line goes in a file the CLI is told to read', async ($, on) => {
+  const w = world(on, undefined, { installed: ['agy'] })
+  w.cli.agy = agyRun()
+  const long = 'x'.repeat(31_000)
+  await launch($, w, { subagent_type: 'general-purpose@agy', prompt: long })
+  await step($, 'a1')
+  const prompt = cliOf(w.spawns[0]!.argv).at(-1)!
+  expect(prompt.length).toBeLessThan(500)
+  expect(prompt).toContain(promptFileOf(w))
+  expect(w.writes.get(promptFileOf(w))).toBe(`${long}\n`)
+  expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
+})
+
+test('a refused action is told with the answer; a run that was refused everything fails with the reason', async ($, on) => {
+  const w = world(on, undefined, { installed: ['agy', 'claude'] })
+  w.cli.agy = [
+    out({ event: 'init', conversation_id: 'conv-denied' }),
+    out({ event: 'result', result: { conversation_id: 'conv-denied', status: 'SUCCESS', response: '', denied_actions: [{ action: 'write_file', display_name: 'WriteFile' }] } }),
+  ]
+  w.cli.claude = [
+    out({ type: 'system', subtype: 'init', session_id: 's1', model: 'm' }),
+    out({ type: 'system', subtype: 'permission_denied', tool_name: 'Bash', tool_use_id: 't1', message: 'needs approval' }),
+    out({ type: 'assistant', message: { content: [{ type: 'text', text: 'I could not run it.' }] } }),
+    out({ type: 'result', subtype: 'success', is_error: false, result: 'I could not run it.', permission_denials: [] }),
+  ]
+  await launch($, w, { subagent_type: 'general-purpose@agy' })
+  await launch($, w, { subagent_type: 'general-purpose@claude-code' })
+  const refusedAll = (await step($, 'a1')).result.answer
+  expect(refusedAll).toContain('agy failed: agy was not allowed to use WriteFile and ended without an answer')
+  expect(refusedAll).toContain('[agy was refused: WriteFile.')
+  expect(refusedAll).toContain("The agent's own safety rules still refuse some actions.")
+  expect(refusedAll).toContain('SendMessage to this agent retries in the same agy session.')
+  const answered = (await step($, 'a2')).result.answer
+  expect(answered.startsWith('I could not run it.')).toBe(true)
+  expect(answered).toContain('[claude was refused: Bash.')
+  expect(answered).not.toContain('failed')
+})
+
+test('the refusal note says what to change: the policy, or the agent type', async ($, on) => {
+  const denied = [
+    out({ type: 'system', subtype: 'init', session_id: 's1', model: 'm' }),
+    out({ type: 'system', subtype: 'permission_denied', tool_name: 'Bash', tool_use_id: 't1', message: 'needs approval' }),
+    out({ type: 'assistant', message: { content: [{ type: 'text', text: 'blocked' }] } }),
+    out({ type: 'result', subtype: 'success', is_error: false, result: 'blocked' }),
+  ]
+  const guarded = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_PERMISSIONS: 'guarded' } })
+  guarded.cli.claude = denied
+  await launch($, guarded, { subagent_type: 'general-purpose@claude-code' })
+  await launch($, guarded, { subagent_type: 'Explore@claude-code' })
+  expect((await step($, 'a1')).result.answer).toContain('PI_SUBAGENT_PERMISSIONS=guarded keeps the agent inside')
+  expect((await step($, 'a2')).result.answer).toContain('This agent type is read-only')
+})
+
+test('a CLI that fails before finishing is reported with what it printed, never retried on Claude', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = [err('Error: no such model "zzz"\n')]
+  w.cliCode = 1
+  await launch($, w, { subagent_type: 'general-purpose@codex/zzz' })
+  const { result } = await step($, 'a1')
+  expect(result.answer).toContain('codex failed: codex exited (code 1) before finishing: Error: no such model "zzz"')
+  expect(result.answer).toContain('SendMessage to this agent retries in a new codex session.')
+  expect(result.answer).not.toContain('PI_PID')
+  expect(w.claudeSteps).toBe(0)
+  expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
+})
+
+test('a CLI that says it failed is the failure, and one that ends with nothing to say is a failure too', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex', 'agy'] })
+  w.cli.codex = [
+    out({ type: 'thread.started', thread_id: 't1' }),
+    out({ type: 'error', message: "Reconnecting... 1/5 (stream disconnected: model 'x' not found)" }),
+    out({ type: 'turn.failed', error: { message: "stream disconnected: model 'x' not found" } }),
+  ]
+  w.cli.agy = [out({ event: 'init', conversation_id: 'c1' }), out({ event: 'result', result: { conversation_id: 'c1', status: 'SUCCESS', response: '' } })]
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  await launch($, w, { subagent_type: 'general-purpose@agy' })
+  const failed = (await step($, 'a1')).result.answer
+  expect(failed).toContain("codex failed: stream disconnected: model 'x' not found")
+  expect(failed).toContain('in the same codex session')
+  expect((await step($, 'a2')).result.answer).toContain('agy failed: agy ended without an answer')
+  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xl' } as never)
+  expect(JSON.stringify(list)).toContain('a1 · general-purpose · failed · codex')
+})
+
+test('a CLI that exits without finishing is done only if it exited cleanly with an answer in hand', async ($, on) => {
+  const w = world(on, undefined, { installed: ['opencode'] })
+  // opencode 1.15.10 with a local model ends on its last message: no closing step event.
+  w.cli.opencode = opencodeRun().slice(0, -1)
+  await launch($, w, { subagent_type: 'general-purpose@opencode' })
+  const done = (await step($, 'a1')).result.answer
+  expect(done).toContain('opencode says hi')
+  expect(done).not.toContain('opencode failed')
+  // The same output from a CLI that crashed: failed, the message only what it said before.
+  w.cliCode = 1
+  await launch($, w, { subagent_type: 'general-purpose@opencode' })
+  const crashed = (await step($, 'a2')).result.answer
+  expect(crashed).toContain('opencode failed: opencode exited (code 1) before finishing')
+  expect(crashed).toContain('Last answer before it failed:\nopencode says hi')
+  // A clean exit with nothing said since its last tool call: failed too.
+  w.cliCode = 0
+  w.cli.opencode = opencodeRun().slice(0, 3)
+  await launch($, w, { subagent_type: 'general-purpose@opencode' })
+  expect((await step($, 'a3')).result.answer).toContain('opencode failed: opencode exited (code 0) before finishing: no output')
+  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xl' } as never)
+  expect(JSON.stringify(list)).toContain('a1 · general-purpose · completed · opencode')
+  expect(JSON.stringify(list)).toContain('a2 · general-purpose · failed · opencode')
+})
+
+test('pi that exits in the middle of its run is a failure even if it exited cleanly: its words so far are no answer', async ($, on) => {
+  const w = world(on)
+  w.pi.noSettle = true
+  await launch($, w, { subagent_type: 'general-purpose' })
+  const { result } = await step($, 'a1')
+  expect(result.answer).toContain('pi failed: pi exited (code 0) before finishing')
+  expect(result.answer).toContain('Last answer before it failed:\npi says hi')
+})
+
+test('a backend that is not installed is refused with what is, and found if it was installed since', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi'] })
+  const refused = (await launch($, w, { subagent_type: 'general-purpose@codex' })) as { deny?: string }
+  expect(refused.deny).toContain('Codex CLI is not installed (no codex on PATH)')
+  expect(refused.deny).toContain('Installed here: pi.')
+  expect(refused.deny).toContain('@claude')
+  expect(w.spawned.length).toBe(0)
+  // Detection is repeated when something asked for is not there.
+  w.installed.add('codex')
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  const { result } = await step($, 'a1')
+  expect(result.answer).toContain('codex says hi')
+})
+
+test('with nothing installed every backend is refused, and pi by its models too', async ($, on) => {
+  const w = world(on, undefined, { installed: [] })
+  const codex = (await launch($, w, { subagent_type: 'general-purpose@codex' })) as { deny?: string }
+  expect(codex.deny).toContain('No supported coding agent is installed here')
+  const pi = (await launch($, w, { subagent_type: 'general-purpose@zai-coding-cn/glm-5.3' })) as { deny?: string }
+  expect(pi.deny).toContain('pi is not installed')
+  expect(w.spawned.length).toBe(0)
+})
+
+test('PI_SUBAGENT_DEFAULT sends unmarked calls to that agent; an @ still decides', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_DEFAULT: 'codex' } })
+  w.cli.codex = codexRun()
+  const d = await describeAgent($)
+  expect(d.description).toContain('Without an `@`, the agent runs on Codex CLI.')
+  await launch($, w, { subagent_type: 'general-purpose' })
+  await launch($, w, { subagent_type: 'general-purpose@claude' })
+  await launch($, w, { subagent_type: 'general-purpose@pi' })
+  await step($, 'a1')
+  await step($, 'a2')
+  await step($, 'a3')
+  expect(cliOf(w.spawns[0]!.argv)[0]).toBe('codex')
+  expect(w.claudeSteps).toBe(1)
+  expect(cliOf(w.spawns[1]!.argv)[0]).toBe('pi')
+  expect(w.spawns.length).toBe(2)
+})
+
+test('a bad PI_SUBAGENT_DEFAULT or PI_SUBAGENT_PERMISSIONS refuses the call and says how to fix it', async ($, on) => {
+  const badDefault = world(on, undefined, { installed: ['pi'], env: { PI_SUBAGENT_DEFAULT: 'gemini' } })
+  const one = (await launch($, badDefault, { subagent_type: 'general-purpose' })) as { deny?: string }
+  expect(one.deny).toContain('PI_SUBAGENT_DEFAULT is "gemini"')
+  expect(one.deny).toContain('claude-code')
+  // An explicit @ does not depend on the default.
+  badDefault.cli.claude = claudeRun()
+  badDefault.installed.add('claude')
+  expect(((await launch($, badDefault, { subagent_type: 'general-purpose@claude' })) as { deny?: string }).deny).toBeUndefined()
+})
+
+test('a bad PI_SUBAGENT_PERMISSIONS refuses the agents that need a policy', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_PERMISSIONS: 'yolo' } })
+  const refused = (await launch($, w, { subagent_type: 'general-purpose@codex' })) as { deny?: string }
+  expect(refused.deny).toContain('PI_SUBAGENT_PERMISSIONS is "yolo"; use bypass or guarded.')
+  expect(w.spawned.length).toBe(0)
+  // Claude's own agents have none.
+  expect(((await launch($, w, { subagent_type: 'general-purpose@claude' })) as { deny?: string }).deny).toBeUndefined()
+})
+
+test('PI_SUBAGENT_PERMISSIONS=guarded keeps each CLI inside its own rules', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'codex', 'agy', 'opencode'], env: { PI_SUBAGENT_PERMISSIONS: 'guarded' } })
+  for (const id of ['claude', 'codex', 'agy', 'opencode']) w.cli[id] = id === 'claude' ? claudeRun() : id === 'codex' ? codexRun() : id === 'agy' ? agyRun() : opencodeRun()
+  for (const agent of ['claude-code', 'codex', 'agy', 'opencode']) await launch($, w, { subagent_type: `general-purpose@${agent}` })
+  for (const id of ['a1', 'a2', 'a3', 'a4']) await step($, id)
+  const [claude, codex, agy, opencode] = w.spawns.map(s => cliOf(s.argv))
+  expect(claude).toContain('--permission-mode=acceptEdits')
+  expect(claude).not.toContain('--dangerously-skip-permissions')
+  expect(codex).toContain('sandbox_mode="workspace-write"')
+  expect(agy).not.toContain('--dangerously-skip-permissions')
+  expect(opencode).not.toContain('--dangerously-skip-permissions')
+})
+
+test('a CLI started by this mod does not route its own subagents again', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_NESTED: '1', PI_SUBAGENT_DEFAULT: 'codex' } })
+  const d = await describeAgent($)
+  expect(d.description).toBe('BASE')
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  await launch($, w, { subagent_type: 'general-purpose' })
+  expect(w.agentCalls.map(c => c.subagent_type)).toEqual(['general-purpose', 'general-purpose'])
+  await step($, 'a1')
+  await step($, 'a2')
+  expect(w.spawns.length).toBe(0)
+  expect(w.claudeSteps).toBe(2)
+})
+
+test('SendMessage reaches only pi mid-run: another CLI reads its prompt once, so the engine queues the message', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  let release = () => {}
+  w.cli.codex = codexRun('late answer', 'thread-1', new Promise<void>(r => (release = r)))
+  await launch($, w, { subagent_type: 'general-purpose@codex', name: 'worker' })
+  const running = step($, 'a1')
+  while (!w.spawns.length) await sleep(5)
+  await sleep(20)
+  const sent = await $.tool.call({ tool: 'SendMessage', tool_use_id: 's1', to: 'worker', message: 'change course' } as never)
+  expect(JSON.stringify(sent)).toContain('engine delivered')
+  expect(w.runs.some(a => a[0] === 'bash' && a.some(x => x.includes('change course')))).toBe(false)
+  release()
+  await running
+})
+
+test('a CLI that says it is done but does not exit is killed after a grace period', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  const clock = w.clock
+  let release = () => {}
+  w.cli.codex = codexRun('done', 'thread-1', new Promise<void>(r => (release = r)))
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  const running = step($, 'a1')
+  while (!w.spawns.length) await sleep(5)
+  await sleep(30)
+  const killed = () => w.runs.some(a => a[0] === 'bash' && a[2]?.includes('pgrep') && a.includes('4242'))
+  await clock.advance(14_000)
+  expect(killed()).toBe(false)
+  await clock.advance(2_000)
+  expect(killed()).toBe(true)
+  release()
+  const { result } = await running
+  expect(result.answer).toContain('done')
+})
+
+test('a CLI that exits by itself is not killed by the grace period', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  const clock = w.clock
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  await step($, 'a1')
+  await clock.advance(60_000)
+  expect(w.runs.some(a => a[0] === 'bash' && a[2]?.includes('pgrep'))).toBe(false)
+})
+
+test('a worktree agent on another backend runs in its worktree, briefed in its prompt', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'general-purpose@codex', isolation: 'worktree' })
+  const { result } = await step($, 'a1')
+  expect(w.spawns[0]?.cwd).toBe('/repo/.claude/worktrees/agent-a1')
+  expect(w.gitRuns.find(r => r.argv[0] === 'reset')?.argv).toEqual(['reset', '--hard', 'aaa1111'])
+  expect(w.writes.get(promptFileOf(w))).toContain('/repo/.claude/worktrees/agent-a1')
+  expect(w.writes.get(promptFileOf(w))).toContain('do the task')
+  expect(result.answer).toContain('worktree-agent-a1')
+})
+
+test('a worktree that is not found stops any backend before it starts, and says which', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'] })
+  w.git.worktrees = false
+  w.cli.claude = claudeRun()
+  await launch($, w, { subagent_type: 'general-purpose@claude-code', isolation: 'worktree' })
+  const { result } = await step($, 'a1')
+  expect(w.spawns.length).toBe(0)
+  expect(result.answer).toContain('claude failed: claude was not started')
+  expect(result.answer).toContain('claude runs only in the worktree the engine made for this agent')
+})
+
+test('the activity tools and the band name the agent that runs it', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'] })
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'Explore@codex/gpt-5.5', name: 'scout' })
+  await step($, 'a1')
+  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x1' } as never)
+  expect(JSON.stringify(list)).toContain('a1 (scout) · Explore · completed · codex · gpt-5.5 · 1 tool uses')
+  const page = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x2', agent_id: 'scout' } as never)
+  expect(JSON.stringify(page)).toContain('a1 · completed · codex · gpt-5.5')
+  expect(JSON.stringify(page)).toContain('shell {')
+  const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
+  const drawn = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+  expect(drawn).toContain('codex')
+  expect(drawn).toContain('gpt-5.5')
+  expect(drawn).toContain('codex says hi')
+  expect(drawn).not.toContain('do the task')
+  const status = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x3', agent_id: 'nobody' } as never)
+  expect(JSON.stringify(status)).toContain('deny')
+})
+
+test('the status line groups the running agents by the backend that runs them', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'] })
+  let release = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  w.cli.codex = codexRun('x', 't', gate)
+  w.pi.gate = gate
+  await launch($, w, { subagent_type: 'general-purpose@codex', name: 'c-agent' })
+  await launch($, w, { subagent_type: 'general-purpose', name: 'p-agent' })
+  const one = step($, 'a1')
+  const two = step($, 'a2')
+  while (w.spawns.length < 2) await sleep(5)
+  await sleep(30)
+  release()
+  await Promise.all([one, two])
+  expect(w.statuses.some(t => t?.includes('codex: c-agent') && t.includes('pi: p-agent'))).toBe(true)
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
+test('session start registers the supervision tools and stays quiet when everything is in order', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'] })
+  const started = await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(started.cwd).toBe('/repo')
+  expect(w.registered).toEqual(['subagent_activity', 'watch_subagent'])
+  expect(w.toasts).toEqual([])
+})
+
+test('session start says so when no agent CLI is installed, and when the settings name something that is not', async ($, on) => {
+  const none = world(on, undefined, { installed: [] })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(none.toasts.length).toBe(1)
+  expect(none.toasts[0]).toContain('none of pi, claude, codex, codebuddy-code, agy, opencode is on PATH')
+})
+
+test('session start warns about a default that is not installed, and a bad policy or default', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi'], env: { PI_SUBAGENT_DEFAULT: 'codex', PI_SUBAGENT_PERMISSIONS: 'yolo' } })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(w.toasts.some(t => t.includes('PI_SUBAGENT_DEFAULT is codex, which is not on PATH'))).toBe(true)
+  expect(w.toasts.some(t => t.includes('PI_SUBAGENT_PERMISSIONS is "yolo"'))).toBe(true)
+})
+
+test('session start checks pi\'s version only when pi is installed', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(w.runs.some(a => a[0] === 'pi')).toBe(false)
+  expect(w.toasts).toEqual([])
+})
+
+test('a nested CLI gets no toasts at session start', async ($, on) => {
+  const w = world(on, undefined, { installed: [], env: { PI_SUBAGENT_NESTED: '1' } })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(w.toasts).toEqual([])
+})

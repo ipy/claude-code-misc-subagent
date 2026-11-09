@@ -1,7 +1,7 @@
 {
   "name": "pi-subagent",
   "version": "0.4.0",
-  "description": "让 Claude Code 的原生子代理用 pi 跑第三方模型（DeepSeek、GLM、Qwen、Gemini…），主代理可纠偏、续接、定期监督",
+  "description": "Run Claude Code's native subagents on other coding agents (pi, Codex, Claude Code, CodeBuddy Code, Antigravity, opencode) and third-party models; the main agent can steer, resume and supervise them",
   "author": {
     "name": "wangyu"
   },

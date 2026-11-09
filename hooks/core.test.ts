@@ -2,9 +2,11 @@ import { test, expect } from 'claude-code/testing'
 import {
   type Activity,
   READ_ONLY_NOTE,
+  READ_ONLY_NOTE_ANY,
   SECTION_CHARS,
   activityPage,
   clampInterval,
+  cleanStderr,
   clip,
   detailPage,
   dialogId,
@@ -21,7 +23,6 @@ import {
   scopeModels,
   scopedNote,
   parseWorktrees,
-  piStderr,
   piVersionNote,
   pushActivity,
   resolveAgent,
@@ -29,6 +30,7 @@ import {
   splitBeats,
   splitType,
   watchSection,
+  wrapArgv,
   worktreeFooter,
   worktreePreface,
 } from './core'
@@ -52,9 +54,9 @@ test('read-only types are case-insensitive', () => {
 test('piArgv: wrapper, session, model, thinking, read-only', () => {
   const plain = piArgv({ cmdFile: '/c', session: ['--session-dir', '/d', '--session-id', 'x'], readOnly: false })
   expect(plain.slice(0, 2)).toEqual(['bash', '-c'])
-  expect(plain.slice(3)).toEqual(['pi-subagent', '/c', 'pi', '--mode', 'rpc', '--session-dir', '/d', '--session-id', 'x'])
+  expect(plain.slice(3)).toEqual(['pi-subagent', 'feed', '/c', 'pi', '--mode', 'rpc', '--session-dir', '/d', '--session-id', 'x'])
   const full = piArgv({ cmdFile: '/c', session: ['--session', '/s.jsonl'], readOnly: true, model: 'p/m', thinking: 'high' })
-  expect(full.slice(5)).toEqual([
+  expect(full.slice(6)).toEqual([
     'pi', '--mode', 'rpc', '--session', '/s.jsonl', '--model', 'p/m', '--thinking', 'high',
     '--tools', 'read,grep,find,ls', '--append-system-prompt', READ_ONLY_NOTE,
   ])
@@ -78,9 +80,9 @@ test('dialogId: only blocking dialogs', () => {
   expect(dialogId({ type: 'response', id: 'q', method: 'confirm' })).toBeUndefined()
 })
 
-test('piStderr drops the wrapper pid and beat lines and the new-session warning', () => {
+test('cleanStderr drops the wrapper pid and beat lines and the new-session warning', () => {
   const raw = "PI_PID 42\nWarning: No project session found with id 'x'; creating a new session with that id.\nError: Model \"m\" not found."
-  expect(piStderr(raw)).toBe('Error: Model "m" not found.')
+  expect(cleanStderr(raw)).toBe('Error: Model "m" not found.')
 })
 
 test('clip flattens whitespace and cuts', () => {
@@ -250,8 +252,8 @@ test('resolveAgent: id, name, prefix, ambiguous, short, missing', () => {
   expect(resolveAgent(list, 'auth').agent?.id).toBe('pi-abcdef12-1')
   expect(resolveAgent(list, 'pi-zzzzz').agent?.id).toBe('pi-zzzzzzzz-3')
   expect(resolveAgent(list, 'pi-abcdef').error).toContain('matches 2')
-  expect(resolveAgent(list, 'pi-z').error).toContain('No pi subagent')
-  expect(resolveAgent(list, 'pi-nothing-here').error).toContain('No pi subagent')
+  expect(resolveAgent(list, 'pi-z').error).toContain('No subagent run by this plugin')
+  expect(resolveAgent(list, 'pi-nothing-here').error).toContain('No subagent run by this plugin')
 })
 
 const LIST = `provider                 model                                               context  max-out  thinking  images
@@ -312,15 +314,39 @@ test('splitBeats takes the wrapper beats out of a stderr chunk', () => {
   expect(splitBeats('PI_BEAT\nPI_BEAT\n')).toEqual({ beats: 2, rest: '' })
   expect(splitBeats('PI_PID 7\nPI_BEAT\nwarn\n')).toEqual({ beats: 1, rest: 'PI_PID 7\nwarn\n' })
   expect(splitBeats('not PI_BEAT\n')).toEqual({ beats: 0, rest: 'not PI_BEAT\n' })
-  expect(piStderr('PI_PID 7\nPI_BEAT\nreal error')).toBe('real error')
+  expect(cleanStderr('PI_PID 7\nPI_BEAT\nreal error')).toBe('real error')
 })
 
-test('the wrapper beats while pi lives and stays out of its stdout', () => {
+test('the wrapper beats while the CLI lives and stays out of its stdout', () => {
   const wrapper = piArgv({ cmdFile: '/c', session: [], readOnly: false })[2] ?? ''
   expect(wrapper).toContain('echo PI_BEAT >&2')
   expect(wrapper).toContain('kill -0 $$')
   expect(wrapper).toContain('>/dev/null &')
   expect(wrapper).toContain('exec "$@"')
+})
+
+test('wrapArgv: the CLI after the mode and file, its stdin the feeder, the file or nothing', () => {
+  const cli = ['codex', 'exec', '-']
+  for (const mode of ['feed', 'file', 'none'] as const) {
+    const argv = wrapArgv(mode, '/p', cli)
+    expect(argv.slice(0, 2)).toEqual(['bash', '-c'])
+    expect(argv.slice(3)).toEqual(['pi-subagent', mode, '/p', ...cli])
+  }
+  const script = wrapArgv('none', '/p', cli)[2] ?? ''
+  // Only what stock macOS has: BSD tail has no --pid, and bash 3.2 has no `wait -n`.
+  expect(script).not.toContain('tail')
+  expect(script).not.toContain('wait -n')
+  expect(script).toContain('export PI_SUBAGENT_NESTED=1')
+  expect(script).toContain('feed) exec "$@" < <(')
+  expect(script).toContain('file) exec "$@" < "$f"')
+  expect(script).toContain('exec "$@" < /dev/null')
+  // The CLI becomes the wrapper's own process, so the pid the wrapper announced is the CLI's.
+  expect(script).toContain('echo "PI_PID $$" >&2')
+})
+
+test('the read-only note for CLIs that cannot be limited to a tool list names no tools', () => {
+  expect(READ_ONLY_NOTE_ANY).toContain('read-only')
+  expect(READ_ONLY_NOTE_ANY).not.toContain('grep')
 })
 
 const PORCELAIN = `worktree /repo
@@ -394,7 +420,9 @@ test('hasThinkingSuffix: a trailing level only', () => {
   expect(hasThinkingSuffix(undefined)).toBe(false)
 })
 
-test('missingWorktreeAdvice: a resume is told to start afresh, a first run that pi never strays', () => {
+test('missingWorktreeAdvice: a resume is told to start afresh, a first run that the agent never strays', () => {
   expect(missingWorktreeAdvice(true)).toContain('start a new agent instead of resuming')
   expect(missingWorktreeAdvice(false)).toContain('never in another checkout')
+  expect(missingWorktreeAdvice(false)).toContain('pi runs only in the worktree')
+  expect(missingWorktreeAdvice(false, 'codex')).toContain('codex runs only in the worktree')
 })
