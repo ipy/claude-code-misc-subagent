@@ -1,6 +1,6 @@
 {
   "name": "polyagent",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Polyagent: run Codex, Gemini, DeepSeek, Kimi, GLM and any Anthropic-compatible model as native Claude Code subagents, with roles, automatic failover and live supervision",
   "author": {
     "name": "wangyu"
@@ -19,5 +19,5 @@
     "anthropic-compatible",
     "llm-gateway"
   ],
-  "repository": "https://github.com/ipy/claude-code-misc-subagent"
+  "repository": "https://github.com/ipy/polyagent"
 }

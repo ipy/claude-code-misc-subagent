@@ -5,7 +5,7 @@
 Polyagent is a Claude Code plugin. Write `subagent_type: "Explore@codex"` (or set up a role and write `"@explore"`) and the subagent runs on another agent's CLI, while staying a first-class Claude Code subagent: it appears in the task list, sends the usual completion notice, works in a git worktree, and can be stopped with TaskStop or continued with SendMessage.
 
 ```
-/plugin install polyagent --marketplace ipy/claude-code-misc-subagent
+/plugin install polyagent --marketplace ipy/polyagent
 ```
 
 ## Why Polyagent
@@ -32,9 +32,9 @@ Claude Code runs the subagent as usual. When the subagent asks its model for the
 
 1. **Install the plugin** (in a Claude Code session):
    ```
-   /plugin install polyagent --marketplace ipy/claude-code-misc-subagent
+   /plugin install polyagent --marketplace ipy/polyagent
    ```
-   Or from a shell: `claude plugin install polyagent --marketplace ipy/claude-code-misc-subagent`. In the desktop app: + next to the input → Plugins → Add marketplace → `ipy/claude-code-misc-subagent` → Add plugin.
+   Or from a shell: `claude plugin install polyagent --marketplace ipy/polyagent`. In the desktop app: + next to the input → Plugins → Add marketplace → `ipy/polyagent` → Add plugin.
 2. **Have at least one agent CLI on `PATH`**, signed in: `codex`, `agy`, `opencode`, `pi`, `codebuddy`, or `claude` for a gateway.
 3. **Just ask:** "have codex review this diff", "explore the repo with gemini-3.8-flash". The Agent tool's description lists the agents installed on your machine and how to name their models, so Claude knows what to write.
 
@@ -128,7 +128,7 @@ The Agent tool's description lists each role with the targets usable right now, 
 `scripts/setup.sh` installs the plugin and writes the configuration, and is safe to run again. In a Claude Code cloud environment, put it in the environment's setup script. The configuration only names variables; the values (`MYGW_API_KEY`, `AGY_AUTH_B64`, …) go in the environment's variables, which the session reads (the setup script can't).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ipy/claude-code-misc-subagent/main/scripts/setup.sh -o /tmp/polyagent-setup.sh
+curl -fsSL https://raw.githubusercontent.com/ipy/polyagent/main/scripts/setup.sh -o /tmp/polyagent-setup.sh
 bash /tmp/polyagent-setup.sh <<'JSON'
 { "gateways": { "mygw": { "baseUrlEnv": "MYGW_BASE_URL", "keyEnv": "MYGW_API_KEY", "models": ["coding", "explore"] } },
   "roles": { "explore": { "type": "Explore", "targets": ["agy/gemini-3.8-flash", "mygw/explore", "claude/haiku"] },
@@ -243,10 +243,10 @@ Files Polyagent writes: pi sessions in `~/.pi/claude-subagents/`; the task of an
 ## Develop
 
 ```bash
-git clone https://github.com/ipy/claude-code-misc-subagent.git
-claude --plugin-dir ./claude-code-misc-subagent
-claude plugin test ./claude-code-misc-subagent       # unit tests and engine-level integration tests
-claude plugin validate --strict ./claude-code-misc-subagent
+git clone https://github.com/ipy/polyagent.git
+claude --plugin-dir ./polyagent
+claude plugin test ./polyagent       # unit tests and engine-level integration tests
+claude plugin validate --strict ./polyagent
 ```
 
 The code is in `hooks/`: `core.ts` (shared helpers: the wrapper script, worktrees, activity, stats), `backends.ts` (the agents: command lines, output parsers, routes; pure), `routing.ts` (gateways and roles: configuration, role resolution, health; pure), `register.tsx` (the Claude Code glue). `scripts/` holds the setup and login scripts.
