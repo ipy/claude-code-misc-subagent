@@ -1,6 +1,8 @@
 # pi-subagent
 
-A Claude Code mod that lets **native subagents run on other coding agents**: [pi](https://pi.dev) (and through it DeepSeek, GLM, Qwen, MiniMax, Gemini, GPT…), Codex CLI, Claude Code itself, CodeBuddy Code, Antigravity (`agy`) and opencode. The main agent (Claude) stays the supervisor.
+A Claude Code mod that lets **native subagents run on other coding agents**: [pi](https://pi.dev) (and through it DeepSeek, GLM, Qwen, MiniMax, Gemini, GPT…), Codex CLI, Claude Code itself (also against any Anthropic-compatible API you configure as a *gateway*), CodeBuddy Code, Antigravity (`agy`) and opencode. The main agent (Claude) stays the supervisor.
+
+You can also define **roles** (explore, coding, review, …): each lists agents and models best first, and `subagent_type: "@explore"` runs on the first one that works, failing over to the next and finally to Claude. Gateways and roles live in one configuration file that a cloud environment's setup script can install: see [Gateways and roles](#gateways-and-roles).
 
 The subagent is still Claude Code's own: it shows up in the ↓ task list, completes with the native notification, can be isolated in a native worktree, stopped with TaskStop, and continued with SendMessage. The mod does one thing: it intercepts the subagent's model request, does not send it to Claude, hands the task to the chosen agent's CLI running headless, and returns that agent's final answer to the engine as the "model reply".
 
@@ -20,12 +22,14 @@ subagent_type: "<type>@<agent>[/<model>][:<effort>]"
 | pi with a thinking level | `general-purpose@minimax-cn/MiniMax-M3.1-Flash-Preview:high`, or add `effort: "high"` |
 | Codex CLI | `general-purpose@codex`, `general-purpose@codex/gpt-5.5:high` |
 | Claude Code as a separate process | `general-purpose@claude-code/opus` |
+| Claude Code on a gateway you configured | `general-purpose@<gateway>/<model>` |
+| A role you configured | `@explore` (the role's agent type), `Plan@review:high` |
 | CodeBuddy Code | `general-purpose@codebuddy-code/glm-5.3` |
 | Antigravity | `general-purpose@agy/gemini-3.8-flash-high` |
 | opencode | `general-purpose@opencode/ollama/qwen3.5:9b` |
 | Claude itself (native) | `model: "haiku"` (or sonnet / opus / fable), or `general-purpose@claude` |
 
-- `<agent>` is `pi`, `claude-code`, `codex`, `codebuddy-code`, `agy` or `opencode`. Anything else after the `@` is a pi model.
+- `<agent>` is `pi`, `claude-code`, `codex`, `codebuddy-code`, `agy` or `opencode`, or the name of a configured gateway or role. Anything else after the `@` is a pi model.
 - `<model>` is whatever that CLI accepts after its own `--model`; leave it out for the CLI's own default. It may hold slashes and colons: for opencode, which names models `<provider>/<model>`, the example above is provider `ollama`, model `qwen3.5:9b`. `agy models` and `opencode models` list the models you can use there; `codebuddy --help` lists CodeBuddy's. A model your CLI cannot use (not installed, or not available on your plan or version) fails the run with the CLI's own error, shown in the answer.
 - `:<effort>` is one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Each CLI gets the nearest value of its own scale: `minimal` becomes `low` for Claude Code and agy, `max` becomes `xhigh` for Codex, and `off` sends nothing (Codex gets `none`). opencode takes the level as its model variant. The Agent tool's `effort` parameter is used when the suffix names none.
 - `@claude` runs the agent natively on Claude. `@claude-code` runs a **separate Claude Code process** instead. It inherits Claude Code's environment, so a gateway or custom model names set with `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_MODEL` serve it too (`general-purpose@claude-code/<your model name>`), but it does not use the main session's model or conversation.
@@ -41,7 +45,8 @@ You rarely write this by hand: the Agent tool's description lists the agents ins
 | `claude-code` | Claude Code 2.1.x | stdin | `--resume` | only `Read,Grep,Glob,LS` |
 | `codex` | Codex CLI 0.135 | stdin | `codex exec resume <thread>` | `read-only` sandbox |
 | `codebuddy-code` | CodeBuddy Code 2.181 | stdin | `--resume` | only `Read,Grep,Glob,LS` |
-| `agy` | agy 1.5.3 | `--prompt=` argument | `--conversation` | no approval flag, so what needs approval (writes) is refused |
+| `agy` | agy 1.5.3 | `--prompt=` argument | `--conversation` | `write_file(*)`, `command(*)` and `mcp(*)` denied for the run (`--settings`): headless agy refuses commands by itself but writes files without asking |
+| gateways | Claude Code 2.1.x | stdin | `--resume` | only `Read,Grep,Glob,LS` |
 | `opencode` | opencode 1.15.10 | argument after `--` | `--session` | `bash` and `edit` denied for the run (`OPENCODE_PERMISSION`) |
 
 A backend is used only if its executable is on `PATH` (`pi`, `claude`, `codex`, `codebuddy-code` / `codebuddy` / `cbc`, `agy`, `opencode`). An Agent call for one that is missing is refused with a message naming the ones that are installed.
@@ -52,14 +57,14 @@ Nobody can answer a permission prompt inside a headless subagent, so **by defaul
 
 | Agent | Default (`bypass`) | `PI_SUBAGENT_PERMISSIONS=guarded` |
 |---|---|---|
-| `claude-code`, `codebuddy-code` | `--dangerously-skip-permissions` | `--permission-mode=acceptEdits` (edits in the directory; commands that need approval are refused) |
+| `claude-code`, gateways, `codebuddy-code` | `--dangerously-skip-permissions` | `--permission-mode=acceptEdits` (edits in the directory; commands that need approval are refused) |
 | `codex` | `danger-full-access` sandbox, approvals never asked | `workspace-write` sandbox, approvals never asked |
 | `agy`, `opencode` | `--dangerously-skip-permissions` | no flag: the headless run refuses what needs approval |
 | `pi` | no permission system | no permission system |
 
 What a CLI refuses is not hidden: the answer ends with `[codex was refused: Bash. …]`, and a run that was refused everything and produced nothing fails with that reason. Read-only types are limited the same way under both settings. CodeBuddy Code still asks for approval on operations it rates high-risk even in `bypass`; those are refused and reported the same way.
 
-To contain a risky task, use `isolation: "worktree"` (the agent works in its own git worktree) and/or `PI_SUBAGENT_PERMISSIONS=guarded`. Claude Code refuses `--dangerously-skip-permissions` when run as root, so use `guarded` there.
+To contain a risky task, use `isolation: "worktree"` (the agent works in its own git worktree) and/or `PI_SUBAGENT_PERMISSIONS=guarded`. Claude Code refuses `--dangerously-skip-permissions` when run as root unless `IS_SANDBOX` is set (Claude Code cloud sessions set it); elsewhere as root use `guarded`.
 
 ## Environment variables
 
@@ -67,9 +72,94 @@ Set them in the environment Claude Code is started from.
 
 | Variable | Values | Effect |
 |---|---|---|
-| `PI_SUBAGENT_DEFAULT` | `claude`, `pi`, `claude-code`, `codex`, `codebuddy-code`, `agy`, `opencode` | Where an Agent call **without** `@` goes. Unset: pi if installed, otherwise Claude. |
+| `PI_SUBAGENT_DEFAULT` | `claude`, `pi`, `claude-code`, `codex`, `codebuddy-code`, `agy`, `opencode`, or a configured role or gateway | Where an Agent call **without** `@` goes. Unset: pi if installed, otherwise Claude. |
+| `PI_SUBAGENT_CONFIG` | JSON, or the path of a JSON file | Gateways and roles, over those in `~/.claude/pi-subagent/config.json`. See [Gateways and roles](#gateways-and-roles). |
+| `AGY_AUTH_B64`, `CODEX_AUTH_B64` | base64 tar of a login | Restored into `$HOME` at session start. See [Saved logins](#saved-logins). |
 | `PI_SUBAGENT_PERMISSIONS` | `bypass` (default), `guarded` | See [Permissions](#permissions). |
 | `PI_SUBAGENT_NESTED` | set by the mod | Exported into every CLI the mod starts, so a Claude Code started as a backend does not route its own subagents again. Do not set it yourself. |
+
+## Gateways and roles
+
+### Configuration
+
+`~/.claude/pi-subagent/config.json`, and `PI_SUBAGENT_CONFIG` (JSON, or a file path) whose entries replace the file's name by name. It is read at every Agent call, so edits count at once; problems are shown when the session starts and in the Agent tool's description.
+
+```json
+{
+  "gateways": {
+    "mygw": {
+      "baseUrlEnv": "MYGW_BASE_URL",
+      "keyEnv": "MYGW_API_KEY",
+      "models": ["coding", "explore"],
+      "env": { "CLAUDE_CODE_EFFORT_LEVEL": "max" }
+    },
+    "local": { "baseUrl": "http://localhost:4000", "auth": "bearer", "keyEnv": "LOCAL_TOKEN", "model": "qwen3-coder" }
+  },
+  "roles": {
+    "explore": { "type": "Explore", "targets": ["agy/gemini-3.8-flash", "mygw/explore", "claude/haiku"] },
+    "coding":  { "targets": ["mygw/coding", "codex/gpt-5.5", "claude/sonnet"] },
+    "review":  { "type": "Plan", "targets": ["agy/gemini-3.8-flash", "claude/sonnet"],
+                 "description": "Have every finding confirmed by @review-confirm before reporting it." },
+    "review-confirm": { "type": "Plan", "targets": ["agy/gemini-4-argon", "claude/opus"] }
+  }
+}
+```
+
+### Gateways
+
+A gateway is Claude Code run against an Anthropic-compatible API (a self-hosted proxy, a provider's Anthropic endpoint, an LLM gateway, …) without touching the main session: `subagent_type: "general-purpose@mygw/coding"`.
+
+| Field | |
+|---|---|
+| `baseUrl` or `baseUrlEnv` | The API's base URL, or the **name** of the variable that holds it (keep private URLs out of files). |
+| `keyEnv` | The **name** of the variable that holds the key. Never the key itself. |
+| `auth` | `api-key` (default: sent as `x-api-key`, `ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). |
+| `model` | The model when a call names none. Without it a model is required (`@mygw/<model>`): Claude Code's own default means nothing to most gateways. |
+| `models` | Names to tell the main agent about (aliases the gateway maps, or its ids). |
+| `env` | Other variables for the CLI, such as `CLAUDE_CODE_EFFORT_LEVEL` or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Secrets are refused here. |
+| `description` | Shown to the main agent. |
+
+The mod never reads the URL or the key. It starts the CLI through a small bash shim that reads the variables the gateway names, so neither value is on a command line (`ps`), in the activity log or in the transcript. The shim also unsets the main session's credentials and `CLAUDE_CODE_REMOTE` (a child `claude` in a Claude Code cloud session that keeps it and talks to another base URL hangs on the sandbox's agent-proxy CA fetch). It sets every Claude Code model slot (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`) to the model asked for, so a gateway alias reaches the gateway; Claude Code's warning that it "doesn't recognize the model" is harmless. A gateway is usable when `claude` is on `PATH` and the variables it names are set. In a cloud environment the network allowlist must include the gateway's host.
+
+### Roles
+
+A role is a list of targets, best first: `<agent>[/<model>][:<effort>]`, `<gateway>/<model>`, or `claude/<opus|sonnet|haiku|fable>` (Claude itself). `subagent_type: "@<role>"` gives the agent the role's `type` (default `general-purpose`); `"<type>@<role>"` chooses the type, and `@<role>:<effort>` sets the effort of targets that name none.
+
+- The agent runs on the first target that can be used now: installed, its variables set, and not failed to start within the last hour.
+- If that target cannot start (it ends with an error before doing anything: a refused key, a bad model, a missing login), the next one runs, in the same turn; the answer says what was skipped. A run that fails after it has started working is not moved: its session belongs to that agent.
+- When the next target is Claude, the step is handed to Claude with that model, and the agent stays on Claude from then on.
+- Read-only types (`Explore`, `Plan`) are read-only on every target.
+
+The Agent tool's description lists the roles with the targets usable right now, so the main agent delegates through them without a skill. A role's `description` is told to the main agent with it, which is where rules such as "confirm every finding with `@review-confirm`" belong.
+
+### Setting it up from a start script
+
+`scripts/setup.sh` installs the plugin and writes the configuration, and can run again safely. In a Claude Code cloud environment, use it in the environment's setup script. The configuration only names variables; the variables themselves (`MYGW_API_KEY`, `AGY_AUTH_B64`, …) go in the environment's settings, where the session (not the setup script) reads them.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ipy/claude-code-misc-subagent/main/scripts/setup.sh -o /tmp/pi-subagent-setup.sh
+bash /tmp/pi-subagent-setup.sh <<'JSON'
+{ "gateways": { "mygw": { "baseUrlEnv": "MYGW_BASE_URL", "keyEnv": "MYGW_API_KEY", "models": ["coding", "explore"] } },
+  "roles": { "explore": { "type": "Explore", "targets": ["agy/gemini-3.8-flash", "mygw/explore", "claude/haiku"] },
+             "coding": { "targets": ["mygw/coding", "claude/sonnet"] } } }
+JSON
+```
+
+Options: `--config FILE` (instead of stdin), `--source` (another marketplace source, such as a fork or a local path), `--no-install` (only the configuration). Without a setup script, put the JSON in `PI_SUBAGENT_CONFIG` in the environment and install the plugin once.
+
+## Saved logins
+
+At session start the mod unpacks `AGY_AUTH_B64` (and `CODEX_AUTH_B64`) into `$HOME`: each is a base64 tar of the CLI's login files. It runs once per container (markers in `~/.model-router/`), never overwrites a file that exists, and bash reads the value from its own environment, so it never passes through the mod, a command line or a log. A run of agy or codex waits for it.
+
+To make such a value without a local browser:
+
+```bash
+bash scripts/auth.sh login agy           # prints a URL to open on any device
+bash scripts/auth.sh finish agy <code>   # the code the page shows after sign-in
+bash scripts/auth.sh save agy            # writes ~/.model-router/AGY_AUTH_B64.txt
+```
+
+Then set the file's content as `AGY_AUTH_B64` where Claude Code starts (for a cloud session, the environment's variables).
 
 ## Features
 
@@ -125,7 +215,7 @@ claude plugin test ./claude-code-misc-subagent       # unit tests and engine-lev
 claude plugin validate --strict ./claude-code-misc-subagent
 ```
 
-The code is in `hooks/`: `core.ts` (helpers shared by all agents: the wrapper script, worktrees, activity, stats), `backends.ts` (the agents: command lines, output parsers, routing; pure, no engine), `register.tsx` (the engine glue). The plugin keeps the name `pi-subagent` so existing installs, tool names (`mcp__pi-subagent__…`) and stored agents keep working.
+The code is in `hooks/`: `core.ts` (helpers shared by all agents: the wrapper script, worktrees, activity, stats), `backends.ts` (the agents: command lines, output parsers, routes; pure, no engine), `routing.ts` (gateways and roles: configuration, role resolution, health; pure), `register.tsx` (the engine glue). `scripts/` holds the setup and login scripts. The plugin keeps the name `pi-subagent` so existing installs, tool names (`mcp__pi-subagent__…`) and stored agents keep working.
 
 ### Adding another coding agent
 
@@ -144,6 +234,8 @@ Then add the argv and parser cases to `hooks/backends.test.ts` using output capt
 - The `subagent_tokens` in the native completion notification is computed by the engine and does not reflect the agent's real usage; read the line at the end of the answer, or `subagent_activity`.
 - While the main agent is idle, a watch notice wakes it as a plugin prompt of its own (folded to one line in the transcript, ctrl+o expands it).
 - `fork` (inherits Claude's context) and `remote` (cloud) cannot run on another agent.
+- A foreground Agent call's hand-back does not show the main agent the agent's id (Claude Code 2.1.319, native agents too), so SendMessage cannot reach it. Launch with `run_in_background: true` when you may want to continue the agent.
+- A role fails over only when a target ends with an error before doing anything. A CLI that hangs without output is stopped by the engine after 600 seconds, as before, and is not failed over.
 - Only pi can be steered while it works; the other agents get the message when their run ends.
 - A Claude Code started with `@claude-code` is a new process: it inherits the environment, but not the main session's model, conversation or approvals. Without a model after `@claude-code/` it starts on its own default (`ANTHROPIC_MODEL` if set).
 - Codex, agy and opencode do not say which model answered, so the header of the answer shows the one you asked for, or `<agent>'s default model`.

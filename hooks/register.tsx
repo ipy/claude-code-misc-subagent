@@ -2,10 +2,13 @@ import { update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 import type { Live } from '../types'
 import {
+  AUTH_RESTORE_SCRIPT,
   BACKENDS,
   type Backend,
   type BackendId,
+  type Names,
   type Policy,
+  type Route,
   backendsNote,
   defaultRoute,
   detectArgv,
@@ -16,6 +19,24 @@ import {
   promptFor,
   stdinOf,
 } from './backends'
+import {
+  type Availability,
+  type Config,
+  type Health,
+  type Source,
+  type Target,
+  CONFIG_FILE,
+  configIsInline,
+  envSetArgv,
+  failedToStart,
+  gatewayVars,
+  healthy,
+  namesOf,
+  parseConfig,
+  resolveRole,
+  routingNote,
+  targetKey,
+} from './routing'
 import {
   type Activity,
   type RunStats,
@@ -144,6 +165,94 @@ function notInstalled(id: BackendId, bins: ReadonlyMap<BackendId, string>) {
   return `${b.title} is not installed (no ${b.bins.join(' or ')} on PATH). ${instead}`
 }
 
+// Saved CLI logins (AGY_AUTH_B64, CODEX_AUTH_B64) unpacked at session start; a run of agy or codex waits for it.
+let restoring: Promise<unknown> | undefined
+
+function restoreLogins($: EngineInterface): Promise<unknown> {
+  return $.process
+    .run(['bash', '-c', AUTH_RESTORE_SCRIPT, 'pi-subagent'], { timeoutMs: 30_000 })
+    .then(ran => {
+      const said = `${ran.stdout}${ran.stderr}`.trim()
+      if (said) $.ui.log(`pi-subagent: ${said}`, { to: 'debug' })
+    })
+    .catch(() => undefined)
+}
+
+// The user's gateways and roles: ~/.claude/pi-subagent/config.json, then PI_SUBAGENT_CONFIG (JSON or a
+// file path) over it. Read at each use, so an edit counts without a restart.
+async function loadConfig($: EngineInterface): Promise<Config> {
+  const home = (await $.env.get('HOME')) ?? ''
+  const sources: Source[] = []
+  const problems: string[] = []
+  const readFile = async (path: string, origin: string, required: boolean) => {
+    if (await $.fs.exists(path).catch(() => false)) sources.push({ origin, text: await $.fs.read(path).catch(() => '') })
+    else if (required) problems.push(`${origin}: ${path} does not exist`)
+  }
+  await readFile(`${home}/${CONFIG_FILE}`, `~/${CONFIG_FILE}`, false)
+  const env = (await $.env.get('PI_SUBAGENT_CONFIG'))?.trim()
+  if (env) {
+    if (configIsInline(env)) sources.push({ origin: 'PI_SUBAGENT_CONFIG', text: env })
+    else await readFile(env.startsWith('~/') ? `${home}${env.slice(1)}` : env, 'PI_SUBAGENT_CONFIG', true)
+  }
+  const cfg = parseConfig(sources)
+  cfg.problems.unshift(...problems)
+  return cfg
+}
+
+// Targets that could not start, by targetKey: kept across sessions, left out of roles for HEALTH_TTL_MS.
+const HEALTH_KEY = 'health'
+
+async function readHealth($: EngineInterface): Promise<Record<string, Health>> {
+  const h = (await $.store.get(HEALTH_KEY).catch(() => undefined)) as Record<string, Health> | undefined
+  return h && typeof h === 'object' ? h : {}
+}
+
+async function noteHealth($: EngineInterface, key: string, error: string | undefined) {
+  const h = await readHealth($)
+  if (error === undefined) {
+    if (!(key in h)) return
+    delete h[key]
+  } else h[key] = { at: Date.now(), error: clip(error, 300) }
+  await $.store.set(HEALTH_KEY, h).catch(() => undefined)
+}
+
+// Whether each target can be used now: its CLI installed, a gateway's variables set and a model
+// to ask for, and (unless asked by name) no failure to start within the last hour.
+async function availability($: EngineInterface, cfg: Config, bins: ReadonlyMap<BackendId, string>) {
+  const vars = unique([...cfg.gateways.values()].flatMap(gatewayVars))
+  const set = vars.length
+    ? new Set((await $.process.run(envSetArgv(vars), { timeoutMs: 15_000 }).catch(() => ({ stdout: '' }))).stdout.split('\n').filter(Boolean))
+    : new Set<string>()
+  const health = await readHealth($)
+  const now = Date.now()
+  const gatewayWhy = (name: string) => {
+    const g = cfg.gateways.get(name)
+    if (!g) return `no gateway named ${name} is configured`
+    if (!bins.has('gateway')) return 'claude is not on PATH'
+    if (g.baseUrlEnv && !set.has(g.baseUrlEnv)) return `${g.baseUrlEnv} is not set`
+    if (g.keyEnv && !set.has(g.keyEnv)) return `${g.keyEnv} is not set`
+    return undefined
+  }
+  const usable = (byName: boolean): Availability => t => {
+    let why: string | undefined
+    if (t.kind === 'claude') return undefined
+    if (t.kind === 'pi') why = bins.has('pi') ? undefined : notInstalled('pi', bins)
+    else if (t.gateway) why = gatewayWhy(t.gateway) ?? (t.model || cfg.gateways.get(t.gateway)?.model ? undefined : `no model: write @${t.gateway}/<model> (the gateway has no default)`)
+    else why = bins.has(t.backend) ? undefined : notInstalled(t.backend, bins)
+    if (why || byName) return why
+    const h = health[targetKey(t)]
+    return healthy(h, now) ? undefined : `could not start ${Math.round((now - h!.at) / 60_000)} min ago (${clip(h!.error, 120)})`
+  }
+  return { usable, gatewayWhy }
+}
+
+// Where an Agent call without `@` goes: PI_SUBAGENT_DEFAULT may also name a role or a gateway.
+function defaultFor(setting: string | undefined, bins: ReadonlyMap<BackendId, string>, names: Names): Route {
+  const word = (setting ?? '').trim().toLowerCase()
+  if (word && (names.roles.has(word) || names.gateways.has(word))) return parseRoute(word, { kind: 'claude' }, names)
+  return defaultRoute(setting, new Set(bins.keys()))
+}
+
 // How the user has set the mod up, read from the environment at each Agent call so a
 // change takes effect without a restart.
 async function readEnv($: EngineInterface) {
@@ -196,7 +305,42 @@ type Kept = {
   // and the directory it ran in, which a resume must run in again.
   session?: string
   cwd?: string
+  // The configured gateway a `gateway` backend runs against, by name (its settings are read at each run).
+  gateway?: string
+  // The role it was asked for, and the targets left to try if this one cannot start.
+  role?: string
+  fallbacks?: Target[]
+  // Set once it has done any work: from then on it stays on its backend.
+  worked?: boolean
+  // It moved to Claude itself (a role's last target): its steps go to this model.
+  native?: string
 }
+
+// Where an agent runs now, as a role target.
+function targetOf(a: Pick<Kept, 'backend' | 'gateway' | 'model' | 'thinking'>): Target {
+  if (a.backend === 'pi') return { kind: 'pi', requested: a.model }
+  return { kind: 'backend', backend: a.backend, gateway: a.gateway, model: a.model }
+}
+
+// Points an agent that has not started at a role's next target.
+function moveTo(a: Agent, t: Exclude<Target, { kind: 'claude' }>) {
+  a.session = undefined
+  a.cwd = undefined
+  if (t.kind === 'pi') {
+    a.backend = 'pi'
+    a.gateway = undefined
+    a.model = t.requested && !/^default(:|$)/.test(t.requested) ? t.requested : undefined
+    a.thinking = undefined
+    return
+  }
+  a.backend = t.backend
+  a.gateway = t.gateway
+  a.model = t.model
+  if (t.level && THINKING_LEVELS.includes(t.level)) a.thinking = t.level
+}
+
+// The name an agent's backend is shown by: a gateway by its own name.
+const labelOf = (a: Pick<Kept, 'backend' | 'gateway'>) => a.gateway ?? BACKENDS[a.backend].label
 
 type Agent = Kept & {
   status: 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
@@ -261,7 +405,7 @@ function showStatus($: EngineInterface) {
   const groups = new Map<string, string[]>()
   for (const a of agents.values()) {
     if (a.status !== 'running') continue
-    const label = BACKENDS[a.backend].label
+    const label = labelOf(a)
     groups.set(label, [...(groups.get(label) ?? []), `${a.name ?? a.type}${a.lastTool ? ` ${a.lastTool}` : ''}${a.watch ? ' (watched)' : ''}`])
   }
   $.ui.status(groups.size ? [...groups].map(([label, rows]) => `${label}: ${rows.join(' · ')}`).join(' · ') : undefined)
@@ -283,6 +427,11 @@ async function keep($: EngineInterface, a: Agent) {
     based: a.based,
     session: a.session,
     cwd: a.cwd,
+    gateway: a.gateway,
+    role: a.role,
+    fallbacks: a.fallbacks,
+    worked: a.worked,
+    native: a.native,
   }
   await $.store.set(`agent:${a.id}`, kept)
 }
@@ -346,7 +495,7 @@ async function enterWorktree($: EngineInterface, a: Agent): Promise<{ cwd: strin
   if (!listed.ok) return { error: `its isolated worktree could not be listed (git worktree list failed in ${session})` }
   const trees = parseWorktrees(listed.out)
   const found = findAgentWorktree(trees, a.id)
-  if ('error' in found) return { error: `${found.error} ${missingWorktreeAdvice(Boolean(a.based), BACKENDS[a.backend].label)}` }
+  if ('error' in found) return { error: `${found.error} ${missingWorktreeAdvice(Boolean(a.based), labelOf(a))}` }
   const { path, branch } = found.worktree
   a.worktree = { path, branch }
   if (a.based) return { cwd: path }
@@ -462,7 +611,7 @@ function tick($: EngineInterface, a: Agent) {
 
 function liveOf(a: Agent): Live {
   return {
-    agent: BACKENDS[a.backend].label,
+    agent: labelOf(a),
     label: `${a.name ? `${a.name} · ` : ''}${a.type}: ${a.description}`,
     status: a.status,
     model: a.stats.model ?? a.model,
@@ -499,7 +648,7 @@ function mirror($: EngineInterface, a: Agent, items: Omit<Activity, 'seq' | 'at'
     if (item.kind === 'user') continue
     const mark = item.kind === 'tool' ? '⏺' : item.kind === 'error' ? '✗' : item.kind === 'retry' ? '↻' : item.kind === 'text' ? '◆' : '⎿'
     void $.session
-      .append({ agentId: a.id, message: { type: 'system', content: [{ type: 'text', text: `${mark} ${BACKENDS[a.backend].label} ${item.summary}` }] } })
+      .append({ agentId: a.id, message: { type: 'system', content: [{ type: 'text', text: `${mark} ${labelOf(a)} ${item.summary}` }] } })
       .catch(() => undefined)
   }
 }
@@ -510,6 +659,7 @@ function mirror($: EngineInterface, a: Agent, items: Omit<Activity, 'seq' | 'at'
 // alone is not enough to keep the agent alive.
 const BEAT = { kind: 'thinking' as const, index: 0, text: '' }
 const BEAT_MIN_MS = 5_000
+const QUIET_START_MS = 60_000
 
 // A prompt longer than this is not put on a command line: one argument is limited (128 KiB
 // on Linux, which 30,000 characters stay under even at 4 bytes each) and a long one fills
@@ -550,23 +700,23 @@ async function* runBackend($: EngineInterface, a: Agent, message: string, signal
     const entered = bin ? await enterWorktree($, a) : undefined
     if (!bin) {
       a.notStarted = true
-      fail(`${b.label} was not started: ${b.title} is not installed (no ${b.bins.join(' or ')} on PATH)`)
+      fail(`${labelOf(a)} was not started: ${b.title} is not installed (no ${b.bins.join(' or ')} on PATH)`)
     } else if (entered && 'error' in entered) {
       a.notStarted = true
-      fail(`${b.label} was not started: ${entered.error}`)
+      fail(`${labelOf(a)} was not started: ${entered.error}`)
     } else if (entered) {
       beats = yield* runChild($, a, b, bin, entered.preface ? `${entered.preface}\n\n${message}` : message, entered.cwd, signal)
     }
     closed = false
   } catch (err) {
     closed = false
-    if (!a.stats.error) fail(`${b.label} could not be run: ${(err as Error).message}`)
+    if (!a.stats.error) fail(`${labelOf(a)} could not be run: ${(err as Error).message}`)
   } finally {
     const stopped = closed || signal.aborted || a.stats.aborted
     if (!stopped && !a.stats.error && !a.stats.answer) {
       a.stats.error = a.stats.denied.length
-        ? `${b.label} was not allowed to use ${unique(a.stats.denied).join(', ')} and ended without an answer`
-        : `${b.label} ended without an answer`
+        ? `${labelOf(a)} was not allowed to use ${unique(a.stats.denied).join(', ')} and ended without an answer`
+        : `${labelOf(a)} ended without an answer`
     }
     a.status = stopped ? 'stopped' : a.stats.error ? 'failed' : 'completed'
     a.lastTool = undefined
@@ -591,14 +741,15 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
     const sessionFile = (await $.fs.list(dir).catch(() => [])).find(f => f.name.endsWith(`_${a.id}.jsonl`))
     const sessionArgs = sessionFile ? ['--session', `${dir}/${sessionFile.name}`] : ['--session-dir', dir, '--session-id', a.id]
     a.cmdFile = `${dir}/${a.id}.cmd.jsonl`
-    if (sessionFile) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: `resumed its ${b.label} session`, detail: '' }])
+    if (sessionFile) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: `resumed its ${labelOf(a)} session`, detail: '' }])
     await $.fs.write(a.cmdFile, rpc.prompt(message) + '\n')
     argv = wrapArgv(stdinOf(b), a.cmdFile, b.argv({ bin, prompt: message, file: a.cmdFile, sessionArgs, model: a.model, effort: a.thinking, readOnly: a.readOnly, policy: a.policy }))
   } else {
+    if (b.id === 'agy' || b.id === 'codex') await restoring
     runCwd = a.cwd ?? cwd
     const dir = await promptDir($)
     a.cmdFile = `${dir}/${a.id}.prompt.txt`
-    if (a.session) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: `resumed its ${b.label} session`, detail: '' }])
+    if (a.session) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: `resumed its ${labelOf(a)} session`, detail: '' }])
     // The backend does not echo the prompt as pi does: the activity records it.
     a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'user', summary: clip(message, 180), detail: cut(message, DETAIL_CHARS) }])
     const prompt = promptFor(b, { prompt: message, readOnly: a.readOnly })
@@ -609,7 +760,9 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
       wrote = a.cmdFile
     }
     const given = bulky ? `Your task is in the file ${a.cmdFile}. Read it completely, then carry it out exactly as written.` : prompt
-    argv = wrapArgv(stdinOf(b), a.cmdFile, b.argv({ bin, prompt: given, file: a.cmdFile, session: a.session, model: a.model, effort: a.thinking, readOnly: a.readOnly, policy: a.policy }))
+    const gateway = a.gateway ? (await loadConfig($)).gateways.get(a.gateway) : undefined
+    if (a.gateway && !gateway) throw new Error(`no gateway named ${a.gateway} is configured any more`)
+    argv = wrapArgv(stdinOf(b), a.cmdFile, b.argv({ bin, prompt: given, file: a.cmdFile, session: a.session, model: a.model, effort: a.thinking, readOnly: a.readOnly, policy: a.policy, gateway }))
   }
 
   const child = $.process.spawn({ argv, cwd: runCwd })
@@ -630,6 +783,10 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
   const due = () => {
     const now = Date.now()
     if (signal.aborted || now - lastBeat < BEAT_MIN_MS) return false
+    // Nothing is yielded in the first minute before the CLI has taken a step: a run that cannot
+    // start leaves the step empty, so a role can still hand it to Claude. Words do not count:
+    // Claude Code tells an API failure as the assistant's words before it fails.
+    if (!a.stats.steps && now - a.runStartedAt < QUIET_START_MS) return false
     lastBeat = now
     return true
   }
@@ -695,7 +852,7 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
     }
     drained = true
   } catch (err) {
-    a.stats.error ??= `${b.label} could not run: ${(err as Error).message}`
+    a.stats.error ??= `${labelOf(a)} could not run: ${(err as Error).message}`
   } finally {
     signal.removeEventListener('abort', kill)
     grace?.cancel()
@@ -710,7 +867,7 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
   // with some providers, ends on its last message). Any other exit before settling is a failure.
   if (!stopped && !a.stats.settled && !a.stats.error && !b.persistent && code === 0 && a.stats.answer.trim()) a.stats.settled = true
   if (!stopped && !a.stats.settled && !a.stats.error) {
-    a.stats.error = `${b.label} exited (code ${code}) before finishing: ${clip(cleanStderr(stderr), 600) || 'no output'}`
+    a.stats.error = `${labelOf(a)} exited (code ${code}) before finishing: ${clip(cleanStderr(stderr), 600) || 'no output'}`
     const items = [{ kind: 'error' as const, summary: clip(a.stats.error, 240), detail: a.stats.error }]
     a.seq = pushActivity(a.events, a.seq, Date.now(), items)
     mirror($, a, items)
@@ -727,29 +884,29 @@ function deniedNote(a: Agent) {
     : a.policy === 'guarded'
       ? 'PI_SUBAGENT_PERMISSIONS=guarded keeps the agent inside its CLI\'s permission rules; unset it to let agents work unattended.'
       : "The agent's own safety rules still refuse some actions."
-  return `\n\n[${BACKENDS[a.backend].label} was refused: ${what}. ${why}]`
+  return `\n\n[${labelOf(a)} was refused: ${what}. ${why}]`
 }
 
-function answerOf(a: Agent) {
+function answerOf(a: Agent, movedToClaude = false) {
   const b = BACKENDS[a.backend]
   const foot = a.worktree ? `\n${worktreeFooter(a.worktree)}` : ''
-  const model = a.stats.model ?? a.model ?? `${b.label}'s default model`
-  const head = `[${b.label} · ${model} · ${a.stats.steps} tool uses]`
+  const model = a.stats.model ?? a.model ?? `${labelOf(a)}'s default model`
+  const head = `[${labelOf(a)} · ${model} · ${a.stats.steps} tool uses]`
   const refused = deniedNote(a)
   if (a.status === 'failed') {
-    const where = b.id === 'pi' || a.session ? `in the same ${b.label} session` : `in a new ${b.label} session`
-    const retry = a.notStarted ? '' : `\n\nSendMessage to this agent retries ${where}.`
-    return `${head}\n${b.label} failed: ${a.stats.error}${a.stats.answer ? `\n\nLast answer before it failed:\n${a.stats.answer}` : ''}${refused}${retry}${foot}`
+    const where = b.id === 'pi' || a.session ? `in the same ${labelOf(a)} session` : `in a new ${labelOf(a)} session`
+    const retry = a.notStarted || movedToClaude ? '' : `\n\nSendMessage to this agent retries ${where}.`
+    return `${head}\n${labelOf(a)} failed: ${a.stats.error}${a.stats.answer ? `\n\nLast answer before it failed:\n${a.stats.answer}` : ''}${refused}${retry}${foot}`
   }
-  if (a.status === 'stopped') return `${head}\n${b.label} was stopped.${a.stats.answer ? `\n\nLast answer:\n${a.stats.answer}` : ''}${foot}`
+  if (a.status === 'stopped') return `${head}\n${labelOf(a)} was stopped.${a.stats.answer ? `\n\nLast answer:\n${a.stats.answer}` : ''}${foot}`
   const u = a.stats.usage
-  return `${a.stats.answer}\n\n[${b.label} · ${model} · ${a.stats.steps} tool uses · ${totalTokens(u)} tokens: ${u.input} in, ${u.output} out, ${u.cacheRead} cache read]${refused}${foot}`
+  return `${a.stats.answer}\n\n[${labelOf(a)} · ${model} · ${a.stats.steps} tool uses · ${totalTokens(u)} tokens: ${u.input} in, ${u.output} out, ${u.cacheRead} cache read]${refused}${foot}`
 }
 
 // What the engine is told the run cost. Other backends' model names are prefixed with
 // the backend, so the engine does not price them as the Claude models they may be named for.
 function usageOf(a: Agent) {
-  const model = a.backend === 'pi' ? a.stats.model : totalTokens(a.stats.usage) > 0 ? `${a.backend}/${a.stats.model ?? a.model ?? 'default'}` : undefined
+  const model = a.backend === 'pi' ? a.stats.model : totalTokens(a.stats.usage) > 0 ? `${a.gateway ?? a.backend}/${a.stats.model ?? a.model ?? 'default'}` : undefined
   if (!model) return null
   return {
     input_tokens: a.stats.usage.input,
@@ -772,13 +929,15 @@ export const register: Register = on => {
     const started = await next(e)
     detected = detect($)
     scope = loadScope($)
-    void Promise.all([detected, readEnv($)]).then(async ([bins, env]) => {
+    restoring = readEnv($).then(env => (env.nested ? undefined : restoreLogins($)))
+    void Promise.all([detected, readEnv($), loadConfig($)]).then(async ([bins, env, cfg]) => {
       if (env.nested) return
+      if (cfg.problems.length) $.ui.toast(`pi-subagent: configuration problems: ${cfg.problems.join(' | ')}`)
       if (!bins.size) {
-        $.ui.toast(`pi-subagent: none of ${Object.values(BACKENDS).map(b => b.bins[0]).join(', ')} is on PATH, so subagents run on Claude until one is installed.`)
+        $.ui.toast(`pi-subagent: none of ${[...new Set(Object.values(BACKENDS).map(b => b.bins[0]))].join(', ')} is on PATH, so subagents run on Claude until one is installed.`)
         return
       }
-      const fallback = defaultRoute(env.fallback, new Set(bins.keys()))
+      const fallback = defaultFor(env.fallback, bins, namesOf(cfg))
       if (fallback.kind === 'error') $.ui.toast(`pi-subagent: ${fallback.error}`)
       else if (fallback.kind === 'backend' && !bins.has(fallback.backend)) {
         $.ui.toast(`pi-subagent: PI_SUBAGENT_DEFAULT is ${fallback.backend}, which is not on PATH; Agent calls without an @ will be refused until it is.`)
@@ -850,35 +1009,71 @@ export const register: Register = on => {
     const [bins, ready] = await Promise.all([Promise.race([detected, waited]), Promise.race([scope, waited])])
     timer?.cancel()
     const { models, fallback } = ready ?? (await scopeNames($))
-    const agents = bins ? backendsNote(bins, defaultRoute(env.fallback, new Set(bins.keys()))) : ''
+    const cfg = await loadConfig($)
+    const names = namesOf(cfg)
+    const agents = bins ? backendsNote(bins, defaultFor(env.fallback, bins, names)) : ''
+    let routing = cfg.problems.length ? routingNote(cfg, [], []) : ''
+    if (bins && (cfg.gateways.size || cfg.roles.size)) {
+      const { usable, gatewayWhy } = await availability($, cfg, bins)
+      routing = routingNote(
+        cfg,
+        [...cfg.gateways.values()].map(gateway => ({ gateway, why: gatewayWhy(gateway.name) })),
+        [...cfg.roles.values()].map(role => ({ role, resolved: resolveRole(role, names, usable(false)) })),
+      )
+    }
     // pi's models are listed when pi is here, or when its settings are all there is to go on.
     const pi = !bins || bins.has('pi') ? (models.length ? scopedNote(models, fallback ?? '') : ANY_MODEL_NOTE) : ''
-    return { ...described, description: `${described.description}${AGENT_HEAD}\n${[agents, pi].filter(Boolean).join('\n')}${AGENT_TAIL}` }
+    return { ...described, description: `${described.description}${AGENT_HEAD}\n${[agents, routing, pi].filter(Boolean).join('\n')}${AGENT_TAIL}` }
   })
 
   // The engine spawns the agent; the call only leaves behind what its backend needs.
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     if (e.tool !== 'Agent') return next(e)
-    const { type, model: requested } = splitType(e.subagent_type)
+    let { type, model: requested } = splitType(e.subagent_type)
     // Claude's own: a fork, a remote agent, a Claude model asked by name.
     if (type === 'fork' || e.isolation === 'remote' || e.model) return next({ ...e, subagent_type: type })
     const env = await readEnv($)
     // A CLI this mod started has its own subagents run by Claude, whatever they ask for.
     if (env.nested) return next({ ...e, subagent_type: type })
     let bins = await (detected ??= detect($))
-    const route = parseRoute(requested, defaultRoute(env.fallback, new Set(bins.keys())))
-    if (route.kind === 'claude') return next({ ...e, subagent_type: type })
+    const cfg = await loadConfig($)
+    const names = namesOf(cfg)
+    let route = parseRoute(requested, defaultFor(env.fallback, bins, names), names)
+    let fallbacks: Target[] = []
+    let role: string | undefined
+    if (route.kind === 'role') {
+      const r = cfg.roles.get(route.role)!
+      role = r.name
+      // `@explore` names no type: the role's.
+      if ((e.subagent_type ?? '').startsWith('@') && r.type) type = r.type
+      // It may have been installed since the session began.
+      bins = await (detected = detect($))
+      const { usable } = await availability($, cfg, bins)
+      const resolved = resolveRole(r, names, usable(false), route.level)
+      const [first, ...rest] = resolved.candidates
+      if (!first) return { deny: `Nothing the ${r.name} role names can be used now: ${resolved.skipped.map(x => `${x.target}: ${x.why}`).join('; ')}. Name an agent, or set model to run on Claude.` }
+      route = first
+      fallbacks = rest
+    }
+    // The Agent tool's own model parameter (opus, sonnet, haiku, fable) runs it on Claude.
+    if (route.kind === 'claude') return next((route.model ? { ...e, subagent_type: type, model: route.model } : { ...e, subagent_type: type }) as typeof e)
     if (route.kind === 'error') return { deny: route.error }
     const policy = policyOf(env.permissions)
     if (typeof policy === 'object') return { deny: policy.error }
     const backend: BackendId = route.kind === 'pi' ? 'pi' : route.backend
     // It may have been installed since the session began.
     if (!bins.has(backend)) bins = await (detected = detect($))
-    if (!bins.has(backend)) return { deny: notInstalled(backend, bins) }
+    if (route.kind === 'backend' && route.gateway) {
+      const why = (await availability($, cfg, bins)).usable(true)(route)
+      if (why) return { deny: `The ${route.gateway} gateway cannot be used: ${why}.` }
+    } else if (!bins.has(backend)) return { deny: notInstalled(backend, bins) }
 
     const base = {
       name: e.name,
       type,
+      role,
+      fallbacks: fallbacks.length ? fallbacks : undefined,
+      gateway: route.kind === 'backend' ? route.gateway : undefined,
       backend,
       policy,
       readOnly: isReadOnlyType(type),
@@ -990,10 +1185,49 @@ export const register: Register = on => {
     if (e.agentId === undefined) mainBusy = true
     const a = e.agentId ? await findKept($, e.agentId) : undefined
     if (!a) return yield* next(e)
+    // An agent that moved to Claude itself stays there.
+    if (a.native) return yield* next({ ...e, model: a.native })
     // The backend's own activity records the message as a user row.
     const message = a.inbox.splice(0).join('\n\n') || 'Continue.'
-    const beats = yield* runBackend($, a, message, next.signal)
-    const answer = answerOf(a) || `(${BACKENDS[a.backend].label} gave no text)`
+    let beats = 0
+    const tried: string[] = []
+    for (;;) {
+      beats += yield* runBackend($, a, message, next.signal)
+      const key = targetKey(targetOf(a))
+      const stopped = a.status === 'stopped'
+      if (!failedToStart(a.stats, stopped)) {
+        if (!a.worked && (a.status === 'completed' || a.stats.steps > 0)) {
+          a.worked = true
+          a.fallbacks = undefined
+          await keep($, a)
+        }
+        if (a.status === 'completed') await noteHealth($, key, undefined)
+        break
+      }
+      // It never started: a role moves on to its next target, on the agent's first turn only.
+      if (a.worked) break
+      await noteHealth($, key, a.stats.error)
+      const to = a.fallbacks?.shift()
+      if (!to) break
+      tried.push(`${key}: ${clip(a.stats.error ?? 'failed', 200)}`)
+      const items = [{ kind: 'note' as const, summary: clip(`${key} could not start; trying ${targetKey(to)}`, 240), detail: a.stats.error ?? '' }]
+      a.seq = pushActivity(a.events, a.seq, Date.now(), items)
+      mirror($, a, items)
+      if (to.kind === 'claude') {
+        a.native = to.model ?? e.model
+        await keep($, a)
+        publish($, a)
+        // A response already begun (beats) cannot be handed over: the next turn goes to Claude.
+        if (beats) break
+        return yield* next({ ...e, model: a.native })
+      }
+      moveTo(a, to)
+      await keep($, a)
+    }
+    const failedOver = tried.length ? `\n\n[${a.role ? `role ${a.role}: ` : ''}could not start ${tried.join('; ')}]` : ''
+    // Moved to Claude after a response had begun: the step could not be handed over, the next can.
+    const onClaude = a.native ? `\n\n[the next message to this agent runs on Claude (${a.native})]` : ''
+    const answer = `${answerOf(a, Boolean(a.native)) || `(${labelOf(a)} gave no text)`}${failedOver}${onClaude}`
     // The answer is the block after the beats' (one block holds one kind of piece).
     yield { kind: 'text', index: beats ? BEAT.index + 1 : 0, text: answer }
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: usageOf(a) }
@@ -1023,7 +1257,7 @@ export const register: Register = on => {
     if (!input.agent_id) {
       const rows = [...agents.values()].map(
         a =>
-          `${a.id}${a.name ? ` (${a.name})` : ''} · ${a.type} · ${a.status} · ${BACKENDS[a.backend].label} · ${a.stats.model ?? a.model ?? 'default model'} · ${a.stats.steps} tool uses${a.watch ? ` · watched every ${a.watch.intervalS}s` : ''} · ${a.description}`,
+          `${a.id}${a.name ? ` (${a.name})` : ''} · ${a.type} · ${a.status} · ${labelOf(a)} · ${a.stats.model ?? a.model ?? 'default model'} · ${a.stats.steps} tool uses${a.watch ? ` · watched every ${a.watch.intervalS}s` : ''} · ${a.description}`,
       )
       return { result: rows.length ? rows.join('\n') : 'No subagents run by another coding agent in this session.' }
     }
@@ -1033,7 +1267,7 @@ export const register: Register = on => {
     if (input.activity_id !== undefined) {
       return { result: detailPage(a.events.find(x => String(x.seq) === String(input.activity_id)), input.offset, input.limit) }
     }
-    const head = `${a.id} · ${a.status} · ${BACKENDS[a.backend].label} · ${a.stats.model ?? a.model ?? 'default model'} · ${a.stats.steps} tool uses this run`
+    const head = `${a.id} · ${a.status} · ${labelOf(a)} · ${a.stats.model ?? a.model ?? 'default model'} · ${a.stats.steps} tool uses this run`
     return { result: `${head}\n${activityPage(a.events, a.bornAt, { limit: input.limit, cursor: input.cursor }).text}` }
   }).catch(($, e, next) => ({ deny: `${$.plugin.name}: reading the activity failed.` }))
 
