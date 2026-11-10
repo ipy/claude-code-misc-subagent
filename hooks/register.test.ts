@@ -47,6 +47,11 @@ type World = {
   writes: Map<string, string>
   submitted: string[]
   claudeSteps: number
+  // The engine appends the prompt from inside its spawn (see agent.spawn below), through this `$`.
+  promptOnSpawn?: any
+  // Agent ids are `<prefix><n>`: the plugin's own state outlives a test, so a test that must not meet
+  // an earlier test's agent of the same id uses another prefix.
+  idPrefix?: string
   // The model each step sent to Claude named.
   claudeModels: string[]
   spawned: string[]
@@ -219,8 +224,18 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
   })
   on('tool.describe', ($, e) => ({ description: e.description }))
   on('agent.spawn', ($, e) => {
-    const agentId = `a${++agents}`
+    const agentId = `${w.idPrefix ?? 'a'}${++agents}`
     w.spawned.push(agentId)
+    // As the engine does: the prompt is appended once the agent exists, not after the hooks above return.
+    if (w.promptOnSpawn) {
+      void w.promptOnSpawn.session.append({
+        message: { type: 'user', role: 'user', content: [{ type: 'text', text: e.prompt }] },
+        door: 'prompt',
+        origin: { kind: 'coordinator' },
+        uuid: `u-spawn-${agentId}`,
+        agentId,
+      } as never)
+    }
     return { model: 'claude-x', agentId }
   })
   // The engine's Agent tool: held open while the test body spawns the agent for it.
@@ -247,7 +262,7 @@ const agentCall = (input: Record<string, unknown>) =>
 
 // Calls the Agent tool and, while the engine's call is open, spawns the agent and
 // hands it its prompt, as the engine does; a call the plugin refused spawns nothing.
-async function launch($: any, w: World, input: Record<string, unknown>) {
+async function launch($: any, w: World, input: Record<string, unknown>, spawnExtra: Record<string, unknown> = {}) {
   const seen = w.agentCalls.length
   const e = agentCall(input) as unknown as { tool_use_id: string; prompt: string; description: string }
   const call = $.tool.call(e)
@@ -270,6 +285,7 @@ async function launch($: any, w: World, input: Record<string, unknown>) {
     parentModel: 'claude-x',
     background: true,
     fork: below.subagent_type === 'fork',
+    ...spawnExtra,
   })
   await $.session.append({
     message: { type: 'user', role: 'user', content: [{ type: 'text', text: e.prompt }] },
@@ -282,14 +298,17 @@ async function launch($: any, w: World, input: Record<string, unknown>) {
   return call
 }
 
-async function step($: any, agentId: string) {
-  const stream = $.turn.step({ turnId: `T${++calls}`, index: 0, model: 'claude-x', messageCount: 1, ...(agentId ? { agentId } : {}) })
+async function step($: any, agentId: string, turn?: { turnId: string; index: number }) {
+  const stream = $.turn.step({ turnId: turn?.turnId ?? `T${++calls}`, index: turn?.index ?? 0, model: 'claude-x', messageCount: 1, ...(agentId ? { agentId } : {}) })
   const texts: string[] = []
+  const tools: { name: string; id: string; json: string }[] = []
   let beats = 0
   for (;;) {
     const r = await stream.next()
-    if (r.done) return { texts, beats, result: r.value }
+    if (r.done) return { texts, beats, tools, result: r.value }
     if (r.value.kind === 'text') texts.push(r.value.text)
+    if (r.value.kind === 'tool') tools.push({ name: r.value.name, id: r.value.id, json: '' })
+    if (r.value.kind === 'input') tools.at(-1)!.json += r.value.json
     if (r.value.kind === 'thinking') beats += 1
   }
 }
@@ -1579,4 +1598,107 @@ test('PI_SUBAGENT_CONFIG may name a file, and a missing one is a problem', async
 test('a configured file that is missing is reported', async ($, on) => {
   world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: '/nope.json' } })
   expect((await describeAgent($)).description).toContain('PI_SUBAGENT_CONFIG: /nope.json does not exist')
+})
+
+// ---- delivering the report through the engine's SubagentHandback tool -------------------------
+
+test('in auto mode the answer is delivered as a SubagentHandback call, not as last words', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun('codex reports')
+  await launch($, w, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'auto' })
+  expect(w.store.get('agent:a1')).toMatchObject({ handback: true })
+  const { texts, tools, result } = await step($, 'a1', { turnId: 'TH1', index: 0 })
+  expect(texts).toEqual([])
+  expect(tools.map(t => t.name)).toEqual(['SubagentHandback'])
+  expect(JSON.parse(tools[0]!.json).message).toContain('codex reports')
+  expect(result).toMatchObject({ answer: '', stopReason: 'tool_use', toolUses: [{ name: 'SubagentHandback' }] })
+  expect((result.toolUses[0].input as { message: string }).message).toContain('[codex · ')
+  expect(result.usage).toMatchObject({ model: 'codex/default' })
+})
+
+test('a second step in the same turn gives the answer again, the other way, without running the backend again', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun('only once')
+  await launch($, w, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'auto' })
+  await step($, 'a1', { turnId: 'TH2', index: 0 })
+  // The hand-back could not be taken: the engine steps the agent again in the same turn.
+  const again = await step($, 'a1', { turnId: 'TH2', index: 1 })
+  expect(w.spawns.length).toBe(1)
+  expect(again.texts.join('')).toContain('only once')
+  expect(again.result).toMatchObject({ stopReason: 'end_turn', toolUses: [], usage: null })
+  // A new turn (a resume) runs the backend again.
+  w.cli.codex = codexRun('second turn', 'thread-codex-1')
+  const next = await step($, 'a1', { turnId: 'TH3', index: 0 })
+  expect(w.spawns.length).toBe(2)
+  expect(JSON.parse(next.tools[0]!.json).message).toContain('second turn')
+})
+
+test('outside auto mode the answer is the last words; asked again, it is handed back once, then said again', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = codexRun('plain words')
+  await launch($, w, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'default' })
+  const first = await step($, 'a1', { turnId: 'TP1', index: 0 })
+  expect(first.texts.join('')).toContain('plain words')
+  expect(first.tools).toEqual([])
+  // Not armed for hand-back: a repeat is the last words again, and the backend does not run again.
+  const again = await step($, 'a1', { turnId: 'TP1', index: 1 })
+  expect(again.tools).toEqual([])
+  expect(again.texts.join('')).toContain('plain words')
+  expect(w.spawns.length).toBe(1)
+})
+
+test('the engine\'s switches: CLAUDE_CODE_DISABLE_SUBAGENT_HANDBACK turns hand-back off, CLAUDE_CODE_SENDMESSAGE_HANDBACK decides when set', async ($, on) => {
+  const off = world(on, undefined, { installed: ['codex'], env: { CLAUDE_CODE_DISABLE_SUBAGENT_HANDBACK: '1' } })
+  off.cli.codex = codexRun()
+  await launch($, off, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'auto' })
+  expect(off.store.get('agent:a1')).toMatchObject({ handback: false })
+  const r = await step($, 'a1')
+  expect(r.tools).toEqual([])
+})
+
+test('CLAUDE_CODE_SENDMESSAGE_HANDBACK=0 turns it off in auto mode too', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'], env: { CLAUDE_CODE_SENDMESSAGE_HANDBACK: '0' } })
+  w.cli.codex = codexRun()
+  await launch($, w, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'auto' })
+  expect(w.store.get('agent:a1')).toMatchObject({ handback: false })
+})
+
+test('a failed run is handed back too, so the caller hears why', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.cli.codex = [{ stream: 'stderr', text: 'boom\n' }]
+  w.cliCode = 3
+  await launch($, w, { subagent_type: 'general-purpose@codex' }, { permissionMode: 'auto' })
+  const { tools } = await step($, 'a1')
+  expect(JSON.parse(tools[0]!.json).message).toContain('codex failed')
+})
+
+test('the prompt the engine appends as soon as it has spawned the agent reaches the backend', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.promptOnSpawn = $
+  w.idPrefix = 'race'
+  let task = ''
+  w.cli.codex = () => {
+    task = w.writes.get(promptFileOf(w, 'race1')) ?? ''
+    return codexRun('done') as (Chunk | Promise<unknown>)[]
+  }
+  const e = agentCall({ subagent_type: 'general-purpose@codex', prompt: 'THE REAL TASK' }) as unknown as { tool_use_id: string; prompt: string; description: string }
+  const call = $.tool.call(e)
+  while (!w.agentCalls.length) await sleep(1)
+  await $.agent.spawn({
+    tool_use_id: e.tool_use_id,
+    prompt: e.prompt,
+    description: e.description,
+    subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-x',
+    background: true,
+    fork: false,
+    permissionMode: 'auto',
+  })
+  w.agentCalls[0]!.done?.()
+  await call
+  // The engine's append has landed before the agent's first step.
+  await sleep(30)
+  await step($, 'race1')
+  expect(task).toContain('THE REAL TASK')
 })
