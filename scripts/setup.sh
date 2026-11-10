@@ -62,15 +62,17 @@ fi
 # ---- plugin ---------------------------------------------------------------------------------
 if [ "$INSTALL" = 1 ]; then
   command -v claude >/dev/null || die "claude is not on PATH; install Claude Code first (or pass --no-install)"
+  # Updates are shown, not hidden: a stale install should say why it stayed stale.
   if claude plugin marketplace list 2>/dev/null | grep -q "$MARKETPLACE"; then
-    claude plugin marketplace update "$MARKETPLACE" >/dev/null 2>&1 || say "could not update the $MARKETPLACE marketplace; keeping the copy there is"
+    claude plugin marketplace update "$MARKETPLACE" || say "WARNING: could not update the $MARKETPLACE marketplace; the copy already here is used"
   else
     claude plugin marketplace add "$SOURCE" || die "could not add the marketplace from $SOURCE"
   fi
   if claude plugin list 2>/dev/null | grep -q "$PLUGIN@$MARKETPLACE"; then
-    claude plugin update "$PLUGIN@$MARKETPLACE" >/dev/null 2>&1 || true
-    say "$PLUGIN is installed"
+    claude plugin update "$PLUGIN@$MARKETPLACE" || say "WARNING: could not update $PLUGIN@$MARKETPLACE"
   else
     claude plugin install "$PLUGIN@$MARKETPLACE" || die "could not install $PLUGIN@$MARKETPLACE"
   fi
+  version=$(claude plugin list 2>/dev/null | grep -A3 "$PLUGIN@$MARKETPLACE" | sed -n 's/.*Version: *//p' | head -1)
+  say "$PLUGIN@$MARKETPLACE ${version:+version $version }is installed"
 fi
