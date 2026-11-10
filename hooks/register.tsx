@@ -377,8 +377,10 @@ type Agent = Kept & {
 type Asked = Omit<Kept, 'id' | 'description'>
 
 const asked = new Map<string, Asked>()
-// Messages for agents whose spawn has not come back yet, by agent id.
+// Messages for agents whose spawn has not come back yet, by agent id, and what the engine's notes
+// said about their hand-back.
 const early = new Map<string, string[]>()
+const earlyHandback = new Map<string, boolean>()
 const EARLY_KEEP_MS = 60_000
 const agents = new Map<string, Agent>()
 const sections = new Map<string, { text: string; cursor: number }>()
@@ -940,6 +942,14 @@ const textOf = (content: readonly { type: string; text?: string }[]) =>
 // as the last words instead is not delivered, and the engine asks the agent again.
 const HANDBACK = 'SubagentHandback'
 
+// What one of the engine's notes to an agent says about its hand-back: armed, withdrawn, or nothing.
+export function handbackNote(text: string): boolean | undefined {
+  if (!text.includes(HANDBACK)) return undefined
+  if (text.includes(`${HANDBACK} is not available`) || /no longer applies/.test(text)) return false
+  if (text.includes(`delivered through ${HANDBACK}`) || text.includes(`call ${HANDBACK}(`)) return true
+  return undefined
+}
+
 const truthy = (v: string | undefined) => v !== undefined && !/^(0|false|no|off)$/i.test(v)
 
 // Whether a subagent spawned in this permission mode reports through SubagentHandback: the engine
@@ -1164,8 +1174,9 @@ export const register: Register = on => {
       const now = Date.now()
       const a: Agent = {
         ...ask,
-        // The subagent inherits its parent's permission mode, which decides how it must report.
-        handback: handbackFor(e.permissionMode, env),
+        // The engine's note to the agent decides; until it comes, the parent's permission mode, which
+        // the subagent inherits.
+        handback: earlyHandback.get(spawned.agentId) ?? handbackFor(e.permissionMode, env),
         id: spawned.agentId,
         description: e.description,
         status: 'idle',
@@ -1177,6 +1188,7 @@ export const register: Register = on => {
         inbox: early.get(spawned.agentId) ?? [],
       }
       early.delete(a.id)
+      earlyHandback.delete(a.id)
       agents.set(a.id, a)
       await keep($, a)
     }
@@ -1203,6 +1215,23 @@ export const register: Register = on => {
       }
     }
     const stored = await next(e)
+    // The engine tells each agent how its report must arrive, in a note of its own: that note decides,
+    // whatever the permission mode at the spawn said (the spawn's mode is not always given).
+    if (e.agentId && e.door === 'note' && !stored.deny) {
+      const said = handbackNote(textOf(e.message.content as { type: string; text?: string }[]))
+      if (said !== undefined) {
+        const known = (await findKept($, e.agentId)) ?? agents.get(e.agentId)
+        if (known) {
+          if (known.handback !== said) {
+            known.handback = said
+            await keep($, known)
+          }
+        } else if (asked.size > 0) {
+          earlyHandback.set(e.agentId, said)
+          $.clock.after(EARLY_KEEP_MS, () => earlyHandback.delete(e.agentId!))
+        }
+      }
+    }
     const toAgent = e.agentId && !stored.deny && e.message.type === 'user' && e.message.role === 'user' && e.door !== 'tool-result' && e.door !== 'note'
     // A resume after a reload appends its message before the agent's step loads it from the store.
     const text = toAgent ? textOf(e.message.content as { type: string; text?: string }[]) : ''
@@ -1246,7 +1275,9 @@ export const register: Register = on => {
     const prev = a.answered
     if (prev && prev.turnId === e.turnId) {
       a.inbox.splice(0)
-      const via = prev.via === 'handback' || prev.tries >= 2 || !a.handback ? 'text' : 'handback'
+      // Asked again after plain last words: the engine wants the hand-back (its note may not have been
+      // seen). Asked again after a hand-back: it could not take it. Two tries, then plain words.
+      const via = prev.via === 'handback' || prev.tries >= 2 ? 'text' : 'handback'
       return yield* respond(a, e, prev.text, null, 0, via, prev.tries + 1)
     }
     // The backend's own activity records the message as a user row.
