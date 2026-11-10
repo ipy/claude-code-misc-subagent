@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up Polyagent for Claude Code: install the plugin and write its configuration (gateways and
+# Set up Polyagent, a Claude Code mod: install it (as a plugin package) and write its configuration (gateways and
 # roles). Safe to run again. Made for a cloud environment's setup script, which runs as root
 # before Claude starts and cannot read the environment's variables or secrets: the configuration
 # names variables (baseUrlEnv, keyEnv), and the mod reads them in the session.
@@ -8,7 +8,7 @@
 #
 #   --config FILE   the configuration JSON to install (- or stdin when it is not a terminal);
 #                   written to ~/.claude/polyagent/config.json
-#   --source SRC    where the plugin's marketplace is (default ipy/polyagent; a
+#   --source SRC    where the mod's marketplace is (default ipy/polyagent; a
 #                   path or URL works too)
 #   --no-install    only write the configuration
 #
