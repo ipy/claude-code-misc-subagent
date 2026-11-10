@@ -52,6 +52,8 @@ type World = {
   // Agent ids are `<prefix><n>`: the plugin's own state outlives a test, so a test that must not meet
   // an earlier test's agent of the same id uses another prefix.
   idPrefix?: string
+  // An engine note appended with the prompt at the spawn (the hand-back instruction).
+  noteOnSpawn?: string
   // The model each step sent to Claude named.
   claudeModels: string[]
   spawned: string[]
@@ -227,6 +229,15 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
     const agentId = `${w.idPrefix ?? 'a'}${++agents}`
     w.spawned.push(agentId)
     // As the engine does: the prompt is appended once the agent exists, not after the hooks above return.
+    if (w.promptOnSpawn && w.noteOnSpawn) {
+      void w.promptOnSpawn.session.append({
+        message: { type: 'user', role: 'user', content: [{ type: 'text', text: w.noteOnSpawn }], isMeta: true },
+        door: 'note',
+        origin: { kind: 'engine' },
+        uuid: `u-note-${agentId}`,
+        agentId,
+      } as never)
+    }
     if (w.promptOnSpawn) {
       void w.promptOnSpawn.session.append({
         message: { type: 'user', role: 'user', content: [{ type: 'text', text: e.prompt }] },
@@ -1640,10 +1651,14 @@ test('outside auto mode the answer is the last words; asked again, it is handed 
   const first = await step($, 'a1', { turnId: 'TP1', index: 0 })
   expect(first.texts.join('')).toContain('plain words')
   expect(first.tools).toEqual([])
-  // Not armed for hand-back: a repeat is the last words again, and the backend does not run again.
+  // Asked again in the same turn: the engine wants a hand-back the mod did not know was armed.
   const again = await step($, 'a1', { turnId: 'TP1', index: 1 })
-  expect(again.tools).toEqual([])
-  expect(again.texts.join('')).toContain('plain words')
+  expect(again.tools.map(t => t.name)).toEqual(['SubagentHandback'])
+  expect(JSON.parse(again.tools[0]!.json).message).toContain('plain words')
+  // And if that could not be taken either, plain words once more; the backend never runs again.
+  const third = await step($, 'a1', { turnId: 'TP1', index: 2 })
+  expect(third.tools).toEqual([])
+  expect(third.texts.join('')).toContain('plain words')
   expect(w.spawns.length).toBe(1)
 })
 
@@ -1701,4 +1716,55 @@ test('the prompt the engine appends as soon as it has spawned the agent reaches 
   await sleep(30)
   await step($, 'race1')
   expect(task).toContain('THE REAL TASK')
+})
+
+const HANDBACK_NOTE = '<system-reminder>\nYour final report is delivered through SubagentHandback: when your work is complete, call SubagentHandback({message: <your full report>}). The call ends your run, so make it your last step.\n</system-reminder>'
+
+test('the engine\'s note to the agent arms the hand-back even when the spawn gave no permission mode', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.idPrefix = 'note'
+  w.cli.codex = codexRun('noted')
+  // No permissionMode at the spawn, as an interactive session may send it.
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  expect(w.store.get('agent:note1')).toMatchObject({ handback: false })
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'text', text: HANDBACK_NOTE }], isMeta: true },
+    door: 'note',
+    origin: { kind: 'engine' },
+    uuid: 'u-note-1',
+    agentId: 'note1',
+  } as never)
+  expect(w.store.get('agent:note1')).toMatchObject({ handback: true })
+  const { tools, texts } = await step($, 'note1')
+  expect(texts).toEqual([])
+  expect(JSON.parse(tools[0]!.json).message).toContain('noted')
+  // The note is not part of the agent's task.
+  expect(w.writes.get(promptFileOf(w, 'note1'))).not.toContain('SubagentHandback')
+})
+
+test('the note can arrive before the spawn has come back, and a note withdrawing it turns it off', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'] })
+  w.idPrefix = 'early'
+  w.promptOnSpawn = $
+  w.noteOnSpawn = HANDBACK_NOTE
+  w.cli.codex = codexRun('early note')
+  const e = agentCall({ subagent_type: 'general-purpose@codex', prompt: 'TASK' }) as unknown as { tool_use_id: string; prompt: string; description: string }
+  const call = $.tool.call(e)
+  while (!w.agentCalls.length) await sleep(1)
+  await $.agent.spawn({ tool_use_id: e.tool_use_id, prompt: e.prompt, description: e.description, subagentType: 'general-purpose', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-x', background: true, fork: false })
+  w.agentCalls[0]!.done?.()
+  await call
+  await sleep(30)
+  expect(w.store.get('agent:early1')).toMatchObject({ handback: true })
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'text', text: '<system-reminder>\nSubagentHandback is not available in this run: an earlier instruction to report through it no longer applies. Write your final report as plain text; it will be delivered.\n</system-reminder>' }], isMeta: true },
+    door: 'note',
+    origin: { kind: 'engine' },
+    uuid: 'u-note-off',
+    agentId: 'early1',
+  } as never)
+  expect(w.store.get('agent:early1')).toMatchObject({ handback: false })
+  const { tools, texts } = await step($, 'early1')
+  expect(tools).toEqual([])
+  expect(texts.join('')).toContain('early note')
 })
