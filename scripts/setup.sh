@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up Polyagent for Claude Code: install the plugin and write its configuration (gateways and
+# Set up Polyagent, a Claude Code mod: install it (as a plugin package) and write its configuration (gateways and
 # roles). Safe to run again. Made for a cloud environment's setup script, which runs as root
 # before Claude starts and cannot read the environment's variables or secrets: the configuration
 # names variables (baseUrlEnv, keyEnv), and the mod reads them in the session.
@@ -8,19 +8,19 @@
 #
 #   --config FILE   the configuration JSON to install (- or stdin when it is not a terminal);
 #                   written to ~/.claude/polyagent/config.json
-#   --source SRC    where the plugin's marketplace is (default ipy/claude-code-misc-subagent; a
+#   --source SRC    where the mod's marketplace is (default ipy/polyagent; a
 #                   path or URL works too)
 #   --no-install    only write the configuration
 #
 # Example (an environment's setup script):
-#   curl -fsSL https://raw.githubusercontent.com/ipy/claude-code-misc-subagent/main/scripts/setup.sh -o /tmp/polyagent-setup.sh
+#   curl -fsSL https://raw.githubusercontent.com/ipy/polyagent/main/scripts/setup.sh -o /tmp/polyagent-setup.sh
 #   bash /tmp/polyagent-setup.sh <<'EOF'
 #   { "gateways": { "mygw": { "baseUrlEnv": "MYGW_BASE_URL", "keyEnv": "MYGW_API_KEY" } },
 #     "roles": { "explore": { "type": "Explore", "targets": ["mygw/explore", "claude/haiku"] } } }
 #   EOF
 set -uo pipefail
 
-SOURCE=ipy/claude-code-misc-subagent
+SOURCE=ipy/polyagent
 MARKETPLACE=polyagent
 PLUGIN=polyagent
 OLD_PLUGIN=pi-subagent@claude-code-pi-subagent
