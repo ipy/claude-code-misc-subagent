@@ -1,4 +1,4 @@
-// Pure helpers of the pi-subagent mod: no `$`, so the tests reach every branch.
+// Pure helpers of the polyagent mod: no `$`, so the tests reach every branch.
 
 // Agent types that only look around: the backend gets read-only tools or a read-only sandbox, and is told so.
 export const READ_ONLY_TYPES = new Set(['explore', 'plan', 'claude-code-guide'])
@@ -77,7 +77,7 @@ export type StdinMode = 'feed' | 'file' | 'none'
 // pid on stderr is what a stop kills. While it lives a beat line goes to stderr every
 // BEAT_EVERY_S: a CLI is silent for as long as one command runs, and a stderr line is
 // what lets the agent's model request show the engine it is still working. The CLI is
-// told it runs inside a subagent (PI_SUBAGENT_NESTED), so a Claude Code started this
+// told it runs inside a subagent (POLYAGENT_NESTED), so a Claude Code started this
 // way does not hand its own subagents to this mod again.
 export const BEAT_EVERY_S = 20
 
@@ -88,7 +88,7 @@ const FEEDER =
   'exec 3< "$f"; b=; while :; do while IFS= read -r -u 3 l; do printf "%s%s\\n" "$b" "$l"; b=; done; b=$b$l; l=; kill -0 $$ 2>/dev/null || break; sleep 0.2; done'
 
 const WRAPPER =
-  'mode="$1"; f="$2"; shift 2; export PI_SUBAGENT_NESTED=1; echo "PI_PID $$" >&2; ' +
+  'mode="$1"; f="$2"; shift 2; export POLYAGENT_NESTED=1; echo "PI_PID $$" >&2; ' +
   `(n=0; while kill -0 $$ 2>/dev/null; do sleep 1; n=$((n+1)); if [ $((n % ${BEAT_EVERY_S})) -eq 0 ]; then echo PI_BEAT >&2; fi; done) >/dev/null & ` +
   `case "$mode" in feed) exec "$@" < <(${FEEDER});; file) exec "$@" < "$f";; *) exec "$@" < /dev/null;; esac`
 
@@ -96,7 +96,7 @@ export const wrapArgv = (stdin: StdinMode, file: string, cli: readonly string[])
   'bash',
   '-c',
   WRAPPER,
-  'pi-subagent',
+  'polyagent',
   stdin,
   file,
   ...cli,
@@ -515,8 +515,8 @@ export function scopedNote(scoped: readonly ModelInfo[], fallback: string) {
 export const PI_TESTED = '1.2'
 
 export function piVersionNote(versionOutput: string | undefined): string | undefined {
-  if (versionOutput === undefined) return 'pi-subagent: `pi` is not on PATH; pi-backed subagents will fail until it is.'
+  if (versionOutput === undefined) return 'polyagent: `pi` is not on PATH; pi-backed subagents will fail until it is.'
   const version = versionOutput.trim().split(/\s+/).pop() ?? ''
   if (version === PI_TESTED || version.startsWith(`${PI_TESTED}.`)) return undefined
-  return `pi-subagent: tested with pi ${PI_TESTED}.x, found ${version || 'an unknown version'}; if subagents misbehave, check pi's RPC and JSON event changes.`
+  return `polyagent: tested with pi ${PI_TESTED}.x, found ${version || 'an unknown version'}; if subagents misbehave, check pi's RPC and JSON event changes.`
 }

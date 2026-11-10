@@ -106,11 +106,11 @@ test('parseConfig refuses what would leak a secret or clash with a name, and kee
 
 test('configIsInline: JSON in the variable, otherwise a path', () => {
   expect(configIsInline('  {"roles":{}}')).toBe(true)
-  expect(configIsInline('~/.config/pi-subagent.json')).toBe(false)
+  expect(configIsInline('~/.config/polyagent.json')).toBe(false)
 })
 
 test('envSetArgv asks bash which variables are set, by name only', () => {
-  expect(envSetArgv(['A', 'B'])).toEqual(['bash', '-c', ENV_SET_SCRIPT, 'pi-subagent', 'A', 'B'])
+  expect(envSetArgv(['A', 'B'])).toEqual(['bash', '-c', ENV_SET_SCRIPT, 'polyagent', 'A', 'B'])
   expect(ENV_SET_SCRIPT).toContain('${!v:-}')
   expect(ENV_SET_SCRIPT).toContain('printf "%s\\n" "$v"')
   expect(ENV_SET_SCRIPT.endsWith('exit 0')).toBe(true)

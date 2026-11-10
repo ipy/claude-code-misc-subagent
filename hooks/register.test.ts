@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { AUTH_RESTORE_SCRIPT, DETECT_SCRIPT, GATEWAY_SHIM } from './backends'
+import { AGY_NOTE, AUTH_RESTORE_SCRIPT, DETECT_SCRIPT, GATEWAY_SHIM } from './backends'
 import { ENV_SET_SCRIPT } from './routing'
 import { READ_ONLY_NOTE_ANY } from './core'
 
@@ -181,7 +181,7 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
   })
   on('process.spawn', async function* ($, e) {
     w.spawns.push({ argv: e.argv, cwd: e.cwd })
-    // The wrapper's arguments end at the CLI's own: bash -c <script> pi-subagent <mode> <file> <cli...>.
+    // The wrapper's arguments end at the CLI's own: bash -c <script> polyagent <mode> <file> <cli...>.
     const script = w.cli[e.argv[6] ?? '']
     if (script) {
       yield { stream: 'stderr' as const, text: 'PI_PID 4242\n' }
@@ -381,7 +381,7 @@ test('the band above the prompt shows the open subagent\'s pi activity, not dimm
   const w = world(on)
   await launch($, w, { subagent_type: 'Explore@codebuddy/deepseek-v4.1-flash' })
   await step($, 'a1')
-  const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
+  const ui = await $.ui.mount({ plugin: 'polyagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
   const drawn = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
   expect(drawn).toContain('completed')
   expect(drawn).toContain('read {"path":"a.txt"}')
@@ -395,7 +395,7 @@ test('the band leaves the main conversation and unknown agents to the engine', a
   await launch($, w, { subagent_type: 'Explore' })
   await step($, 'a1')
   for (const view of [{}, { agentId: 'zz' }]) {
-    const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view } }).catch(() => undefined)
+    const ui = await $.ui.mount({ plugin: 'polyagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view } }).catch(() => undefined)
     expect(await ui?.find({ text: 'pi' })).toBeUndefined()
   }
 })
@@ -706,7 +706,7 @@ test('a step the engine closes mid-run stops the agent and kills pi with its com
   release()
   await closing.catch(() => undefined)
   expect(w.runs.some(a => a[0] === 'bash' && a[2]?.includes('pgrep') && a.includes('4242'))).toBe(true)
-  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xc' } as never)
+  const list = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'xc' } as never)
   expect(JSON.stringify(list)).toContain('a1 (closed) · general-purpose · stopped')
 })
 
@@ -774,18 +774,18 @@ test('activity lists and pages; watch notices wake an idle session and ride the 
   while (!w.spawns.length) await new Promise(r => setTimeout(r, 5))
   await new Promise(r => setTimeout(r, 20))
 
-  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x1' } as never)
+  const list = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'x1' } as never)
   expect(JSON.stringify(list)).toContain('a1 (watched)')
-  const page = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x2', agent_id: 'watched' } as never)
+  const page = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'x2', agent_id: 'watched' } as never)
   expect(JSON.stringify(page)).toContain('read {')
-  const bad = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x3', action: 'start', agent_id: 'nobody' } as never)
+  const bad = await $.tool.call({ tool: 'mcp__polyagent__watch_subagent', tool_use_id: 'x3', action: 'start', agent_id: 'nobody' } as never)
   expect(JSON.stringify(bad)).toContain('deny')
 
-  const started = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x4', action: 'start', agent_id: 'watched', interval_seconds: 5 } as never)
+  const started = await $.tool.call({ tool: 'mcp__polyagent__watch_subagent', tool_use_id: 'x4', action: 'start', agent_id: 'watched', interval_seconds: 5 } as never)
   expect(JSON.stringify(started)).toContain('every 30s')
   await clock.advance(30_000)
   await clock.settle()
-  expect(w.submitted.some(t => t.includes('<pi-subagent-watch>'))).toBe(true)
+  expect(w.submitted.some(t => t.includes('<polyagent-watch>'))).toBe(true)
 
   // A main model request marks the loop busy, as after a reload mid-turn.
   await step($, undefined as never)
@@ -794,24 +794,24 @@ test('activity lists and pages; watch notices wake an idle session and ride the 
   await clock.settle()
   expect(w.submitted.length).toBe(before)
   // No row of its own: it waits for the main loop's next tool result and joins it.
-  expect(session.appended().some(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))).toBe(false)
+  expect(session.appended().some(r => !r.agentId && JSON.stringify(r.message.content).includes('<polyagent-watch>'))).toBe(false)
   await mainToolResult($, 'out')
-  const rows = session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))
+  const rows = session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<polyagent-watch>'))
   expect(rows.length).toBe(1)
   const block = rows[0]!.message.content[0] as { type: string; tool_use_id: string; content: { type: string; text: string }[] }
   expect(block.type).toBe('tool_result')
   expect(block.tool_use_id).toBe('tu-main')
   expect(block.content[0]).toEqual({ type: 'text', text: 'out' })
-  expect(block.content[1]?.text).toContain('<pi-subagent-watch>')
+  expect(block.content[1]?.text).toContain('<polyagent-watch>')
   // Delivered once: a later tool result brings nothing new.
   await mainToolResult($, 'out2')
-  expect(session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>')).length).toBe(1)
+  expect(session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<polyagent-watch>')).length).toBe(1)
 
-  const status = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x5', action: 'status', agent_id: 'watched' } as never)
+  const status = await $.tool.call({ tool: 'mcp__polyagent__watch_subagent', tool_use_id: 'x5', action: 'status', agent_id: 'watched' } as never)
   expect(JSON.stringify(status)).toContain('Watching a1 every 30s')
   release()
   await running
-  const done = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x6', action: 'status', agent_id: 'watched' } as never)
+  const done = await $.tool.call({ tool: 'mcp__polyagent__watch_subagent', tool_use_id: 'x6', action: 'status', agent_id: 'watched' } as never)
   expect(JSON.stringify(done)).toContain('is not watched (completed)')
 })
 
@@ -832,7 +832,7 @@ async function mainToolResult($: any, text: string) {
 const out = (ev: object): Chunk => ({ stream: 'stdout', text: JSON.stringify(ev) + '\n' })
 const err = (text: string): Chunk => ({ stream: 'stderr', text })
 
-// The wrapper's arguments: bash -c <script> pi-subagent <mode> <file> <cli...>.
+// The wrapper's arguments: bash -c <script> polyagent <mode> <file> <cli...>.
 const modeOf = (argv: readonly string[]) => argv[4]
 const fileOf = (argv: readonly string[]) => argv[5]
 const cliOf = (argv: readonly string[]) => argv.slice(6)
@@ -879,7 +879,7 @@ const ALL = ['pi', 'claude', 'codex', 'codebuddy', 'agy', 'opencode']
 const describeAgent = ($: any) => $.tool.describe({ tool: 'Agent', description: 'BASE', provider: { plugin: 'engine', tier: 'core' } } as never)
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 // The prompt file of the first agent, and what the plugin wrote into it.
-const promptFileOf = (w: World, id = 'a1') => `${HOME}/.claude/pi-subagent/${id}.prompt.txt`
+const promptFileOf = (w: World, id = 'a1') => `${HOME}/.claude/polyagent/${id}.prompt.txt`
 
 test('describe names every installed agent, how to ask for it, and where an unmarked call goes', async ($, on) => {
   world(on, undefined, { installed: ['pi', 'claude', 'codex'] })
@@ -924,7 +924,7 @@ test('claude: its CLI runs headless in the agent\'s directory, its prompt in a p
   expect(cliOf(spawn.argv).join(' ')).not.toContain('do the task')
   expect(spawn.cwd).toBe('/repo')
   expect(w.writes.get(promptFileOf(w))).toBe('do the task\n')
-  expect(w.runs).toContainEqual(['mkdir', '-p', '-m', '700', `${HOME}/.claude/pi-subagent`])
+  expect(w.runs).toContainEqual(['mkdir', '-p', '-m', '700', `${HOME}/.claude/polyagent`])
   expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
   // No pi command file, and the engine's model is never asked.
   expect([...w.writes.keys()].some(f => f.endsWith('cmd.jsonl'))).toBe(false)
@@ -957,7 +957,7 @@ test('claude: the session it begins is continued by a resume, in the directory i
   expect(second.cwd).toBe('/repo')
   expect(w.writes.get(promptFileOf(w))).toBe('and now?\n')
   expect(result.answer).toContain('second')
-  const page = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xr', agent_id: 'a1' } as never)
+  const page = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'xr', agent_id: 'a1' } as never)
   expect(JSON.stringify(page)).toContain('resumed its claude session')
 })
 
@@ -1031,7 +1031,7 @@ test('agy: the prompt is the value of its flag and no file is written; the conve
   const spawn = w.spawns[0]!
   expect(modeOf(spawn.argv)).toBe('none')
   expect(cliOf(spawn.argv)).toEqual([
-    'agy', '--output-format=stream-json', '--model=Gemini 3.8 Flash (High)', '--dangerously-skip-permissions', '--prompt=do the task',
+    'agy', '--output-format=stream-json', '--model=Gemini 3.8 Flash (High)', '--dangerously-skip-permissions', `--prompt=${AGY_NOTE}\n\ndo the task`,
   ])
   expect(w.writes.has(promptFileOf(w))).toBe(false)
   expect(w.runs.some(a => a[0] === 'rm')).toBe(false)
@@ -1073,7 +1073,7 @@ test('a prompt too long for a command line goes in a file the CLI is told to rea
   const prompt = cliOf(w.spawns[0]!.argv).at(-1)!
   expect(prompt.length).toBeLessThan(500)
   expect(prompt).toContain(promptFileOf(w))
-  expect(w.writes.get(promptFileOf(w))).toBe(`${long}\n`)
+  expect(w.writes.get(promptFileOf(w))).toBe(`${AGY_NOTE}\n\n${long}\n`)
   expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
 })
 
@@ -1109,11 +1109,11 @@ test('the refusal note says what to change: the policy, or the agent type', asyn
     out({ type: 'assistant', message: { content: [{ type: 'text', text: 'blocked' }] } }),
     out({ type: 'result', subtype: 'success', is_error: false, result: 'blocked' }),
   ]
-  const guarded = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_PERMISSIONS: 'guarded' } })
+  const guarded = world(on, undefined, { installed: ['claude'], env: { POLYAGENT_PERMISSIONS: 'guarded' } })
   guarded.cli.claude = denied
   await launch($, guarded, { subagent_type: 'general-purpose@claude-code' })
   await launch($, guarded, { subagent_type: 'Explore@claude-code' })
-  expect((await step($, 'a1')).result.answer).toContain('PI_SUBAGENT_PERMISSIONS=guarded keeps the agent inside')
+  expect((await step($, 'a1')).result.answer).toContain('POLYAGENT_PERMISSIONS=guarded keeps the agent inside')
   expect((await step($, 'a2')).result.answer).toContain('This agent type is read-only')
 })
 
@@ -1144,7 +1144,7 @@ test('a CLI that says it failed is the failure, and one that ends with nothing t
   expect(failed).toContain("codex failed: stream disconnected: model 'x' not found")
   expect(failed).toContain('in the same codex session')
   expect((await step($, 'a2')).result.answer).toContain('agy failed: agy ended without an answer')
-  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xl' } as never)
+  const list = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'xl' } as never)
   expect(JSON.stringify(list)).toContain('a1 · general-purpose · failed · codex')
 })
 
@@ -1167,7 +1167,7 @@ test('a CLI that exits without finishing is done only if it exited cleanly with 
   w.cli.opencode = opencodeRun().slice(0, 3)
   await launch($, w, { subagent_type: 'general-purpose@opencode' })
   expect((await step($, 'a3')).result.answer).toContain('opencode failed: opencode exited (code 0) before finishing: no output')
-  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'xl' } as never)
+  const list = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'xl' } as never)
   expect(JSON.stringify(list)).toContain('a1 · general-purpose · completed · opencode')
   expect(JSON.stringify(list)).toContain('a2 · general-purpose · failed · opencode')
 })
@@ -1205,8 +1205,8 @@ test('with nothing installed every backend is refused, and pi by its models too'
   expect(w.spawned.length).toBe(0)
 })
 
-test('PI_SUBAGENT_DEFAULT sends unmarked calls to that agent; an @ still decides', async ($, on) => {
-  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_DEFAULT: 'codex' } })
+test('POLYAGENT_DEFAULT sends unmarked calls to that agent; an @ still decides', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { POLYAGENT_DEFAULT: 'codex' } })
   w.cli.codex = codexRun()
   const d = await describeAgent($)
   expect(d.description).toContain('Without an `@`, the agent runs on Codex CLI.')
@@ -1222,10 +1222,10 @@ test('PI_SUBAGENT_DEFAULT sends unmarked calls to that agent; an @ still decides
   expect(w.spawns.length).toBe(2)
 })
 
-test('a bad PI_SUBAGENT_DEFAULT or PI_SUBAGENT_PERMISSIONS refuses the call and says how to fix it', async ($, on) => {
-  const badDefault = world(on, undefined, { installed: ['pi'], env: { PI_SUBAGENT_DEFAULT: 'gemini' } })
+test('a bad POLYAGENT_DEFAULT or POLYAGENT_PERMISSIONS refuses the call and says how to fix it', async ($, on) => {
+  const badDefault = world(on, undefined, { installed: ['pi'], env: { POLYAGENT_DEFAULT: 'gemini' } })
   const one = (await launch($, badDefault, { subagent_type: 'general-purpose' })) as { deny?: string }
-  expect(one.deny).toContain('PI_SUBAGENT_DEFAULT is "gemini"')
+  expect(one.deny).toContain('POLYAGENT_DEFAULT is "gemini"')
   expect(one.deny).toContain('claude-code')
   // An explicit @ does not depend on the default.
   badDefault.cli.claude = claudeRun()
@@ -1233,17 +1233,17 @@ test('a bad PI_SUBAGENT_DEFAULT or PI_SUBAGENT_PERMISSIONS refuses the call and 
   expect(((await launch($, badDefault, { subagent_type: 'general-purpose@claude' })) as { deny?: string }).deny).toBeUndefined()
 })
 
-test('a bad PI_SUBAGENT_PERMISSIONS refuses the agents that need a policy', async ($, on) => {
-  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_PERMISSIONS: 'yolo' } })
+test('a bad POLYAGENT_PERMISSIONS refuses the agents that need a policy', async ($, on) => {
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { POLYAGENT_PERMISSIONS: 'yolo' } })
   const refused = (await launch($, w, { subagent_type: 'general-purpose@codex' })) as { deny?: string }
-  expect(refused.deny).toContain('PI_SUBAGENT_PERMISSIONS is "yolo"; use bypass or guarded.')
+  expect(refused.deny).toContain('POLYAGENT_PERMISSIONS is "yolo"; use bypass or guarded.')
   expect(w.spawned.length).toBe(0)
   // Claude's own agents have none.
   expect(((await launch($, w, { subagent_type: 'general-purpose@claude' })) as { deny?: string }).deny).toBeUndefined()
 })
 
-test('PI_SUBAGENT_PERMISSIONS=guarded keeps each CLI inside its own rules', async ($, on) => {
-  const w = world(on, undefined, { installed: ['claude', 'codex', 'agy', 'opencode'], env: { PI_SUBAGENT_PERMISSIONS: 'guarded' } })
+test('POLYAGENT_PERMISSIONS=guarded keeps each CLI inside its own rules', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'codex', 'agy', 'opencode'], env: { POLYAGENT_PERMISSIONS: 'guarded' } })
   for (const id of ['claude', 'codex', 'agy', 'opencode']) w.cli[id] = id === 'claude' ? claudeRun() : id === 'codex' ? codexRun() : id === 'agy' ? agyRun() : opencodeRun()
   for (const agent of ['claude-code', 'codex', 'agy', 'opencode']) await launch($, w, { subagent_type: `general-purpose@${agent}` })
   for (const id of ['a1', 'a2', 'a3', 'a4']) await step($, id)
@@ -1256,7 +1256,7 @@ test('PI_SUBAGENT_PERMISSIONS=guarded keeps each CLI inside its own rules', asyn
 })
 
 test('a CLI started by this mod does not route its own subagents again', async ($, on) => {
-  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { PI_SUBAGENT_NESTED: '1', PI_SUBAGENT_DEFAULT: 'codex' } })
+  const w = world(on, undefined, { installed: ['pi', 'codex'], env: { POLYAGENT_NESTED: '1', POLYAGENT_DEFAULT: 'codex' } })
   const d = await describeAgent($)
   expect(d.description).toBe('BASE')
   await launch($, w, { subagent_type: 'general-purpose@codex' })
@@ -1340,18 +1340,18 @@ test('the activity tools and the band name the agent that runs it', async ($, on
   w.cli.codex = codexRun()
   await launch($, w, { subagent_type: 'Explore@codex/gpt-5.5', name: 'scout' })
   await step($, 'a1')
-  const list = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x1' } as never)
+  const list = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'x1' } as never)
   expect(JSON.stringify(list)).toContain('a1 (scout) · Explore · completed · codex · gpt-5.5 · 1 tool uses')
-  const page = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x2', agent_id: 'scout' } as never)
+  const page = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'x2', agent_id: 'scout' } as never)
   expect(JSON.stringify(page)).toContain('a1 · completed · codex · gpt-5.5')
   expect(JSON.stringify(page)).toContain('shell {')
-  const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
+  const ui = await $.ui.mount({ plugin: 'polyagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
   const drawn = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
   expect(drawn).toContain('codex')
   expect(drawn).toContain('gpt-5.5')
   expect(drawn).toContain('codex says hi')
   expect(drawn).not.toContain('do the task')
-  const status = await $.tool.call({ tool: 'mcp__pi-subagent__subagent_activity', tool_use_id: 'x3', agent_id: 'nobody' } as never)
+  const status = await $.tool.call({ tool: 'mcp__polyagent__subagent_activity', tool_use_id: 'x3', agent_id: 'nobody' } as never)
   expect(JSON.stringify(status)).toContain('deny')
 })
 
@@ -1391,11 +1391,11 @@ test('session start says so when no agent CLI is installed, and when the setting
 })
 
 test('session start warns about a default that is not installed, and a bad policy or default', async ($, on) => {
-  const w = world(on, undefined, { installed: ['pi'], env: { PI_SUBAGENT_DEFAULT: 'codex', PI_SUBAGENT_PERMISSIONS: 'yolo' } })
+  const w = world(on, undefined, { installed: ['pi'], env: { POLYAGENT_DEFAULT: 'codex', POLYAGENT_PERMISSIONS: 'yolo' } })
   await $.session.start({ cwd: '/repo' } as never)
   await sleep(50)
-  expect(w.toasts.some(t => t.includes('PI_SUBAGENT_DEFAULT is codex, which is not on PATH'))).toBe(true)
-  expect(w.toasts.some(t => t.includes('PI_SUBAGENT_PERMISSIONS is "yolo"'))).toBe(true)
+  expect(w.toasts.some(t => t.includes('POLYAGENT_DEFAULT is codex, which is not on PATH'))).toBe(true)
+  expect(w.toasts.some(t => t.includes('POLYAGENT_PERMISSIONS is "yolo"'))).toBe(true)
 })
 
 test('session start checks pi\'s version only when pi is installed', async ($, on) => {
@@ -1407,7 +1407,7 @@ test('session start checks pi\'s version only when pi is installed', async ($, o
 })
 
 test('a nested CLI gets no toasts at session start', async ($, on) => {
-  const w = world(on, undefined, { installed: [], env: { PI_SUBAGENT_NESTED: '1' } })
+  const w = world(on, undefined, { installed: [], env: { POLYAGENT_NESTED: '1' } })
   await $.session.start({ cwd: '/repo' } as never)
   await sleep(50)
   expect(w.toasts).toEqual([])
@@ -1423,7 +1423,7 @@ const CONFIG = JSON.stringify({
     coding: { targets: ['mygw/coding'] },
   },
 })
-const withConfig = (extra: Record<string, string> = {}) => ({ env: { PI_SUBAGENT_CONFIG: CONFIG, ...GW_ENV, ...extra } })
+const withConfig = (extra: Record<string, string> = {}) => ({ env: { POLYAGENT_CONFIG: CONFIG, ...GW_ENV, ...extra } })
 
 // What Claude Code prints when the gateway refuses it (as seen live): an init, the error as its words, a failed result.
 const gatewayRefused: CliScript = [
@@ -1441,7 +1441,7 @@ test('gateway: Claude Code runs through the shim with only variable names on its
   expect(w.agentCalls[0]?.subagent_type).toBe('general-purpose')
   const { result } = await step($, 'a1')
   const cli = cliOf(w.spawns[0]!.argv)
-  expect(cli.slice(0, 8)).toEqual(['bash', '-c', GATEWAY_SHIM, 'pi-subagent-gateway', '', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
+  expect(cli.slice(0, 8)).toEqual(['bash', '-c', GATEWAY_SHIM, 'polyagent-gateway', '', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
   expect(cli).toContain('ANTHROPIC_MODEL=coding')
   expect(flag(w.spawns[0]!.argv, '--effort')).toBe('high')
   // Neither the key nor the private URL is anywhere the mod passes or keeps.
@@ -1457,7 +1457,7 @@ test('gateway: Claude Code runs through the shim with only variable names on its
 })
 
 test('gateway: refused with what is missing, and @gateway is not a name', async ($, on) => {
-  const unset = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: CONFIG, MYGW_BASE_URL: 'https://x' } })
+  const unset = world(on, undefined, { installed: ['claude'], env: { POLYAGENT_CONFIG: CONFIG, MYGW_BASE_URL: 'https://x' } })
   const r1 = (await launch($, unset, { subagent_type: 'general-purpose@mygw/coding' })) as { deny?: string }
   expect(r1.deny).toBe('The mygw gateway cannot be used: MYGW_API_KEY is not set.')
   const r2 = (await launch($, unset, { subagent_type: 'general-purpose@mygw' })) as { deny?: string }
@@ -1530,7 +1530,7 @@ test('a role whose CLIs all fail hands the step to Claude with the role\'s model
 
 test('a role with nothing usable is refused with the reasons, and one whose first is Claude goes to Claude', async ($, on) => {
   const cfg = JSON.stringify({ roles: { solo: ['mygw/coding'], deep: ['claude/opus', 'codex'] }, gateways: { mygw: { baseUrlEnv: 'MYGW_BASE_URL' } } })
-  const w = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: cfg } })
+  const w = world(on, undefined, { installed: ['claude'], env: { POLYAGENT_CONFIG: cfg } })
   const r = (await launch($, w, { subagent_type: '@solo' })) as { deny?: string }
   expect(r.deny).toContain('Nothing the solo role names can be used now: mygw/coding: MYGW_BASE_URL is not set')
   await launch($, w, { subagent_type: 'Plan@deep' })
@@ -1559,8 +1559,8 @@ test('a failure after the agent has worked does not move it: its session belongs
 test('the configuration file is read, the variable over it; problems are told at session start and in the description', async ($, on) => {
   const w = world(on, undefined, {
     installed: ['claude'],
-    env: { ...GW_ENV, PI_SUBAGENT_CONFIG: JSON.stringify({ roles: { coding: ['mygw/coding'] }, gateways: { codex: { baseUrl: 'x' } } }) },
-    files: { [`${HOME}/.claude/pi-subagent/config.json`]: CONFIG },
+    env: { ...GW_ENV, POLYAGENT_CONFIG: JSON.stringify({ roles: { coding: ['mygw/coding'] }, gateways: { codex: { baseUrl: 'x' } } }) },
+    files: { [`${HOME}/.claude/polyagent/config.json`]: CONFIG },
   })
   await $.session.start({ cwd: '/repo' } as never)
   await sleep(50)
@@ -1574,8 +1574,8 @@ test('the configuration file is read, the variable over it; problems are told at
   for (const secret of Object.values(GW_ENV)) expect(d.description).not.toContain(secret)
 })
 
-test('PI_SUBAGENT_DEFAULT can name a role', async ($, on) => {
-  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig({ PI_SUBAGENT_DEFAULT: 'explore', MYGW_API_KEY: '' }) })
+test('POLYAGENT_DEFAULT can name a role', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig({ POLYAGENT_DEFAULT: 'explore', MYGW_API_KEY: '' }) })
   w.cli.agy = agyRun()
   await launch($, w, { subagent_type: 'general-purpose' })
   await step($, 'a1')
@@ -1594,21 +1594,21 @@ test('session start restores saved logins with a script that reads them itself, 
 })
 
 test('a nested CLI does not restore logins again', async ($, on) => {
-  const w = world(on, undefined, { installed: ['agy'], env: { PI_SUBAGENT_NESTED: '1' } })
+  const w = world(on, undefined, { installed: ['agy'], env: { POLYAGENT_NESTED: '1' } })
   await $.session.start({ cwd: '/repo' } as never)
   await sleep(50)
   expect(w.runs.some(a => a[2] === AUTH_RESTORE_SCRIPT)).toBe(false)
 })
 
-test('PI_SUBAGENT_CONFIG may name a file, and a missing one is a problem', async ($, on) => {
-  const w = world(on, undefined, { installed: ['claude'], env: { ...GW_ENV, PI_SUBAGENT_CONFIG: '~/gw.json' }, files: { [`${HOME}/gw.json`]: CONFIG } })
+test('POLYAGENT_CONFIG may name a file, and a missing one is a problem', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'], env: { ...GW_ENV, POLYAGENT_CONFIG: '~/gw.json' }, files: { [`${HOME}/gw.json`]: CONFIG } })
   expect((await describeAgent($)).description).toContain('`@mygw`')
   void w
 })
 
 test('a configured file that is missing is reported', async ($, on) => {
-  world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: '/nope.json' } })
-  expect((await describeAgent($)).description).toContain('PI_SUBAGENT_CONFIG: /nope.json does not exist')
+  world(on, undefined, { installed: ['claude'], env: { POLYAGENT_CONFIG: '/nope.json' } })
+  expect((await describeAgent($)).description).toContain('POLYAGENT_CONFIG: /nope.json does not exist')
 })
 
 // ---- delivering the report through the engine's SubagentHandback tool -------------------------
@@ -1767,4 +1767,58 @@ test('the note can arrive before the spawn has come back, and a note withdrawing
   const { tools, texts } = await step($, 'early1')
   expect(tools).toEqual([])
   expect(texts.join('')).toContain('early note')
+})
+
+// ---- names from before the project was Polyagent -----------------------------------------------
+
+test('the PI_SUBAGENT_* variables still count when the POLYAGENT_* ones are not set, and the new ones win', async ($, on) => {
+  const old = world(on, undefined, { installed: ['codex'], env: { PI_SUBAGENT_DEFAULT: 'codex', PI_SUBAGENT_PERMISSIONS: 'guarded' } })
+  old.cli.codex = codexRun()
+  await launch($, old, { subagent_type: 'general-purpose' })
+  await step($, 'a1')
+  expect(cliOf(old.spawns[0]!.argv)[0]).toBe('codex')
+  expect(old.spawns[0]!.argv.join(' ')).toContain('sandbox_mode="workspace-write"')
+})
+
+test('POLYAGENT_DEFAULT wins over PI_SUBAGENT_DEFAULT', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex', 'agy'], env: { PI_SUBAGENT_DEFAULT: 'codex', POLYAGENT_DEFAULT: 'agy' } })
+  w.cli.agy = agyRun()
+  await launch($, w, { subagent_type: 'general-purpose' })
+  await step($, 'a1')
+  expect(cliOf(w.spawns[0]!.argv)[0]).toBe('agy')
+})
+
+test('a CLI started by the version before the rename is still taken as nested', async ($, on) => {
+  const w = world(on, undefined, { installed: ['codex'], env: { PI_SUBAGENT_NESTED: '1' } })
+  await launch($, w, { subagent_type: 'general-purpose@codex' })
+  expect(w.agentCalls[0]?.subagent_type).toBe('general-purpose')
+  await step($, 'a1')
+  expect(w.spawns.length).toBe(0)
+  expect(w.claudeSteps).toBe(1)
+})
+
+test('the old configuration file and PI_SUBAGENT_CONFIG are read while the new ones are missing', async ($, on) => {
+  world(on, undefined, {
+    installed: ['claude'],
+    env: { ...GW_ENV, PI_SUBAGENT_CONFIG: JSON.stringify({ roles: { coding: ['mygw/coding'] } }) },
+    files: { [`${HOME}/.claude/pi-subagent/config.json`]: CONFIG },
+  })
+  const d = (await describeAgent($)).description
+  expect(d).toContain('`@mygw`')
+  expect(d).toContain('`@coding`: mygw/coding')
+  expect(d).toContain('`@explore` (Explore)')
+})
+
+test('the new configuration file wins over the old one', async ($, on) => {
+  world(on, undefined, {
+    installed: ['claude'],
+    env: GW_ENV,
+    files: {
+      [`${HOME}/.claude/polyagent/config.json`]: JSON.stringify({ roles: { fresh: ['claude/haiku'] } }),
+      [`${HOME}/.claude/pi-subagent/config.json`]: CONFIG,
+    },
+  })
+  const d = (await describeAgent($)).description
+  expect(d).toContain('`@fresh`')
+  expect(d).not.toContain('`@explore`')
 })

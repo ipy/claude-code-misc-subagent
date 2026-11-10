@@ -1,9 +1,23 @@
 {
-  "name": "pi-subagent",
-  "version": "0.5.1",
-  "description": "Run Claude Code's native subagents on other coding agents (pi, Codex, Claude Code, CodeBuddy Code, Antigravity, opencode) and Anthropic-compatible gateways, routed by role with failover; the main agent can steer, resume and supervise them",
+  "name": "polyagent",
+  "version": "0.6.0",
+  "description": "Polyagent: run Codex, Gemini, DeepSeek, Kimi, GLM and any Anthropic-compatible model as native Claude Code subagents, with roles, automatic failover and live supervision",
   "author": {
     "name": "wangyu"
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "keywords": [
+    "claude-code",
+    "subagents",
+    "codex",
+    "gemini",
+    "antigravity",
+    "opencode",
+    "deepseek",
+    "kimi",
+    "multi-model",
+    "anthropic-compatible",
+    "llm-gateway"
+  ],
+  "repository": "https://github.com/ipy/claude-code-misc-subagent"
 }

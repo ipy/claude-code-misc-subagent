@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Log in to agy without a local browser, and carry logins across sessions (pi-subagent's model-router).
-# The pi-subagent mod runs the same restore at session start, so `restore` is rarely needed by hand.
+# Log in to agy without a local browser, and carry logins across sessions (polyagent's model-router).
+# The polyagent mod runs the same restore at session start, so `restore` is rarely needed by hand.
 #   auth.sh login  agy          start the CLI's login in tmux, print the URL to open
 #   auth.sh finish agy <code>   paste the code shown on the page after sign-in
 #   auth.sh save   agy          pack the new login files into an env-var value (file)
@@ -54,7 +54,7 @@ finish() { # kind [code]
     sleep 1
     if ! screen "$kind" | grep -qi "$pending"; then
       sleep 3; tmux kill-session -t "$s" 2>/dev/null
-      rm -f "${TMPDIR:-/tmp}/pi-subagent-router.cache" "${TMPDIR:-/tmp}/model-router.cache"   # force a fresh probe
+      rm -f "${TMPDIR:-/tmp}/polyagent-router.cache" "${TMPDIR:-/tmp}/model-router.cache"   # force a fresh probe
       echo "Signed in to $kind. To keep this login in future sessions run: auth.sh save $kind"
       return 0
     fi

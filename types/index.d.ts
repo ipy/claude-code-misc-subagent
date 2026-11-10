@@ -8,6 +8,6 @@ export type Live = { agent?: string; label: string; status: string; model?: stri
 
 declare module 'claude-code' {
   interface PluginState {
-    'pi-subagent': { live: StateFamily<Live> }
+    'polyagent': { live: StateFamily<Live> }
   }
 }

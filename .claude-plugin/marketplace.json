@@ -1,6 +1,13 @@
 {
-  "name": "claude-code-pi-subagent",
-  "description": "Claude Code mod: native subagents that run on other coding agents (pi, Codex, Claude Code, CodeBuddy Code, Antigravity, opencode) and third-party models",
-  "owner": { "name": "yu1745" },
-  "plugins": [{ "name": "pi-subagent", "source": "./" }]
+  "name": "polyagent",
+  "description": "Polyagent: any coding agent or model as a native Claude Code subagent (Codex, Gemini, DeepSeek, Kimi, GLM, opencode, any Anthropic-compatible API)",
+  "owner": {
+    "name": "yu1745"
+  },
+  "plugins": [
+    {
+      "name": "polyagent",
+      "source": "./"
+    }
+  ]
 }

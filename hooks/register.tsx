@@ -26,6 +26,7 @@ import {
   type Source,
   type Target,
   CONFIG_FILE,
+  LEGACY_CONFIG_FILE,
   configIsInline,
   envSetArgv,
   failedToStart,
@@ -90,8 +91,8 @@ An agent with \`isolation: "worktree"\` that runs on another agent gets its own 
 const AGENT_TAIL = `
 - \`effort\` sets the agent's reasoning level when the \`@\` suffix carries no \`:<effort>\` (pi: thinking level).
 - SendMessage to a pi agent while it works steers it (pi reads it after its current tool calls); any other agent reads it once its current run ends, in the same session. After an agent finished, SendMessage resumes it as usual. TaskStop stops it.
-- Permissions: pi has none; the other agents run unattended, with their permission prompts off (set PI_SUBAGENT_PERMISSIONS=guarded in the environment to keep each CLI's own restrictions). Explore, Plan and claude-code-guide agents are always read-only.
-- Supervision (opt-in; third-party models can drift or stall): mcp__pi-subagent__subagent_activity reads its recent activity without consuming anything; mcp__pi-subagent__watch_subagent sends you periodic activity evidence while it works. Do not poll by default.`
+- Permissions: pi has none; the other agents run unattended, with their permission prompts off (set POLYAGENT_PERMISSIONS=guarded in the environment to keep each CLI's own restrictions). Explore, Plan and claude-code-guide agents are always read-only.
+- Supervision (opt-in; third-party models can drift or stall): mcp__polyagent__subagent_activity reads its recent activity without consuming anything; mcp__polyagent__watch_subagent sends you periodic activity evidence while it works. Do not poll by default.`
 
 const ANY_MODEL_NOTE =
   `- Models on pi: append \`@<provider>/<model>\` to subagent_type (\`general-purpose@codebuddy/glm-5.3\`), optionally \`:<thinking>\`; omitted, pi's default. \`pi --list-models <search>\` in Bash lists models.\n- ${DEFAULT_NOTE}`
@@ -170,15 +171,15 @@ let restoring: Promise<unknown> | undefined
 
 function restoreLogins($: EngineInterface): Promise<unknown> {
   return $.process
-    .run(['bash', '-c', AUTH_RESTORE_SCRIPT, 'pi-subagent'], { timeoutMs: 30_000 })
+    .run(['bash', '-c', AUTH_RESTORE_SCRIPT, 'polyagent'], { timeoutMs: 30_000 })
     .then(ran => {
       const said = `${ran.stdout}${ran.stderr}`.trim()
-      if (said) $.ui.log(`pi-subagent: ${said}`, { to: 'debug' })
+      if (said) $.ui.log(`polyagent: ${said}`, { to: 'debug' })
     })
     .catch(() => undefined)
 }
 
-// The user's gateways and roles: ~/.claude/pi-subagent/config.json, then PI_SUBAGENT_CONFIG (JSON or a
+// The user's gateways and roles: ~/.claude/polyagent/config.json, then POLYAGENT_CONFIG (JSON or a
 // file path) over it. Read at each use, so an edit counts without a restart.
 async function loadConfig($: EngineInterface): Promise<Config> {
   const home = (await $.env.get('HOME')) ?? ''
@@ -188,11 +189,16 @@ async function loadConfig($: EngineInterface): Promise<Config> {
     if (await $.fs.exists(path).catch(() => false)) sources.push({ origin, text: await $.fs.read(path).catch(() => '') })
     else if (required) problems.push(`${origin}: ${path} does not exist`)
   }
-  await readFile(`${home}/${CONFIG_FILE}`, `~/${CONFIG_FILE}`, false)
-  const env = (await $.env.get('PI_SUBAGENT_CONFIG'))?.trim()
+  // The file from before the project was Polyagent counts while there is no new one.
+  const file = (await $.fs.exists(`${home}/${CONFIG_FILE}`).catch(() => false)) ? CONFIG_FILE : LEGACY_CONFIG_FILE
+  await readFile(`${home}/${file}`, `~/${file}`, false)
+  const [name, env] = await (async () => {
+    const now = (await $.env.get('POLYAGENT_CONFIG'))?.trim()
+    return now ? ['POLYAGENT_CONFIG', now] : ['PI_SUBAGENT_CONFIG', (await $.env.get('PI_SUBAGENT_CONFIG'))?.trim()]
+  })()
   if (env) {
-    if (configIsInline(env)) sources.push({ origin: 'PI_SUBAGENT_CONFIG', text: env })
-    else await readFile(env.startsWith('~/') ? `${home}${env.slice(1)}` : env, 'PI_SUBAGENT_CONFIG', true)
+    if (configIsInline(env)) sources.push({ origin: name, text: env })
+    else await readFile(env.startsWith('~/') ? `${home}${env.slice(1)}` : env, name, true)
   }
   const cfg = parseConfig(sources)
   cfg.problems.unshift(...problems)
@@ -246,7 +252,7 @@ async function availability($: EngineInterface, cfg: Config, bins: ReadonlyMap<B
   return { usable, gatewayWhy }
 }
 
-// Where an Agent call without `@` goes: PI_SUBAGENT_DEFAULT may also name a role or a gateway.
+// Where an Agent call without `@` goes: POLYAGENT_DEFAULT may also name a role or a gateway.
 function defaultFor(setting: string | undefined, bins: ReadonlyMap<BackendId, string>, names: Names): Route {
   const word = (setting ?? '').trim().toLowerCase()
   if (word && (names.roles.has(word) || names.gateways.has(word))) return parseRoute(word, { kind: 'claude' }, names)
@@ -260,19 +266,20 @@ async function readEnv($: EngineInterface) {
   const set = (value: string | undefined) => (value ?? '').trim() || undefined
   return {
     // Set by the wrapper in every CLI it starts: a Claude Code started that way does not route its own subagents again.
-    nested: set(await $.env.get('PI_SUBAGENT_NESTED')) !== undefined,
+    // (PI_SUBAGENT_* are the names from before the project was Polyagent, still honoured.)
+    nested: (set(await $.env.get('POLYAGENT_NESTED')) ?? set(await $.env.get('PI_SUBAGENT_NESTED'))) !== undefined,
     // The engine's own switches for subagents' hand-back tool (see handbackFor).
     noHandback: set(await $.env.get('CLAUDE_CODE_DISABLE_SUBAGENT_HANDBACK')),
     handback: set(await $.env.get('CLAUDE_CODE_SENDMESSAGE_HANDBACK')),
-    fallback: set(await $.env.get('PI_SUBAGENT_DEFAULT')),
-    permissions: set(await $.env.get('PI_SUBAGENT_PERMISSIONS')),
+    fallback: set(await $.env.get('POLYAGENT_DEFAULT')) ?? set(await $.env.get('PI_SUBAGENT_DEFAULT')),
+    permissions: set(await $.env.get('POLYAGENT_PERMISSIONS')) ?? set(await $.env.get('PI_SUBAGENT_PERMISSIONS')),
   }
 }
 
-const ACTIVITY_TOOL = 'mcp__pi-subagent__subagent_activity'
-const WATCH_TOOL = 'mcp__pi-subagent__watch_subagent'
-const WATCH_TAG = '<pi-subagent-watch>'
-const LIVE = { plugin: 'pi-subagent', key: 'live' } as const
+const ACTIVITY_TOOL = 'mcp__polyagent__subagent_activity'
+const WATCH_TOOL = 'mcp__polyagent__watch_subagent'
+const WATCH_TAG = '<polyagent-watch>'
+const LIVE = { plugin: 'polyagent', key: 'live' } as const
 const LIVE_LINES = 40
 const LIVE_MARK: Record<string, { mark: string; color: string }> = {
   tool: { mark: '⏺', color: 'suggestion' },
@@ -399,7 +406,7 @@ async function subagentDir($: EngineInterface) {
 
 // The other backends' prompt files, removed when a run ends.
 async function promptDir($: EngineInterface) {
-  return `${(await $.env.get('HOME')) ?? '/tmp'}/.claude/pi-subagent`
+  return `${(await $.env.get('HOME')) ?? '/tmp'}/.claude/polyagent`
 }
 
 // Made before a file goes in it, so a first run does not depend on anything having made it. Private
@@ -409,7 +416,7 @@ async function ensureDir($: EngineInterface, dir: string) {
 }
 
 async function appendLine($: EngineInterface, file: string, text: string) {
-  const ran = await $.process.run(['bash', '-c', 'printf "%s\\n" "$1" >> "$2"', 'pi-subagent', text, file])
+  const ran = await $.process.run(['bash', '-c', 'printf "%s\\n" "$1" >> "$2"', 'polyagent', text, file])
   if (ran.exitCode !== 0) throw new Error(ran.stderr.trim() || 'append failed')
 }
 
@@ -533,7 +540,7 @@ async function enterWorktree($: EngineInterface, a: Agent): Promise<{ cwd: strin
 type Section = [string, { text: string; cursor: number }]
 
 function noticeText(secs: Section[]) {
-  return [WATCH_TAG, SUPERVISION_NOTE, ...secs.map(([, s]) => s.text), '</pi-subagent-watch>'].join('\n\n')
+  return [WATCH_TAG, SUPERVISION_NOTE, ...secs.map(([, s]) => s.text), '</polyagent-watch>'].join('\n\n')
 }
 
 function delivered(secs: Section[]) {
@@ -592,7 +599,7 @@ async function flush($: EngineInterface) {
     sent = true
     delivered(secs)
   } catch (err) {
-    $.ui.log(`pi-subagent: a watch notice was not delivered (${(err as Error).message}); retrying`, { to: 'debug' })
+    $.ui.log(`polyagent: a watch notice was not delivered (${(err as Error).message}); retrying`, { to: 'debug' })
     putBack(secs)
   } finally {
     delivering = false
@@ -781,7 +788,7 @@ async function* runChild($: EngineInterface, a: Agent, b: Backend, bin: string, 
 
   const child = $.process.spawn({ argv, cwd: runCwd })
   const kill = () => {
-    if (a.pid) void $.process.run(['bash', '-c', KILL_TREE, 'pi-subagent', a.pid])
+    if (a.pid) void $.process.run(['bash', '-c', KILL_TREE, 'polyagent', a.pid])
   }
   signal.addEventListener('abort', kill, { once: true })
   const parse = b.parser()
@@ -896,7 +903,7 @@ function deniedNote(a: Agent) {
   const why = a.readOnly
     ? 'This agent type is read-only; use general-purpose for work that changes files.'
     : a.policy === 'guarded'
-      ? 'PI_SUBAGENT_PERMISSIONS=guarded keeps the agent inside its CLI\'s permission rules; unset it to let agents work unattended.'
+      ? 'POLYAGENT_PERMISSIONS=guarded keeps the agent inside its CLI\'s permission rules; unset it to let agents work unattended.'
       : "The agent's own safety rules still refuse some actions."
   return `\n\n[${labelOf(a)} was refused: ${what}. ${why}]`
 }
@@ -983,18 +990,18 @@ export const register: Register = on => {
     restoring = readEnv($).then(env => (env.nested ? undefined : restoreLogins($)))
     void Promise.all([detected, readEnv($), loadConfig($)]).then(async ([bins, env, cfg]) => {
       if (env.nested) return
-      if (cfg.problems.length) $.ui.toast(`pi-subagent: configuration problems: ${cfg.problems.join(' | ')}`)
+      if (cfg.problems.length) $.ui.toast(`polyagent: configuration problems: ${cfg.problems.join(' | ')}`)
       if (!bins.size) {
-        $.ui.toast(`pi-subagent: none of ${[...new Set(Object.values(BACKENDS).map(b => b.bins[0]))].join(', ')} is on PATH, so subagents run on Claude until one is installed.`)
+        $.ui.toast(`polyagent: none of ${[...new Set(Object.values(BACKENDS).map(b => b.bins[0]))].join(', ')} is on PATH, so subagents run on Claude until one is installed.`)
         return
       }
       const fallback = defaultFor(env.fallback, bins, namesOf(cfg))
-      if (fallback.kind === 'error') $.ui.toast(`pi-subagent: ${fallback.error}`)
+      if (fallback.kind === 'error') $.ui.toast(`polyagent: ${fallback.error}`)
       else if (fallback.kind === 'backend' && !bins.has(fallback.backend)) {
-        $.ui.toast(`pi-subagent: PI_SUBAGENT_DEFAULT is ${fallback.backend}, which is not on PATH; Agent calls without an @ will be refused until it is.`)
+        $.ui.toast(`polyagent: POLYAGENT_DEFAULT is ${fallback.backend}, which is not on PATH; Agent calls without an @ will be refused until it is.`)
       }
       const policy = policyOf(env.permissions)
-      if (typeof policy === 'object') $.ui.toast(`pi-subagent: ${policy.error}`)
+      if (typeof policy === 'object') $.ui.toast(`polyagent: ${policy.error}`)
       if (bins.has('pi')) {
         const ran = await $.process.run(['pi', '--version'], { timeoutMs: 30_000 }).catch(() => undefined)
         const note = ran && ran.exitCode === 0 ? piVersionNote(ran.stdout) : undefined
@@ -1327,7 +1334,7 @@ export const register: Register = on => {
     // An agent run by another backend never falls back to a Claude request.
     if (!e.agentId || !agents.has(e.agentId)) return yield* next(e)
     const a = agents.get(e.agentId)!
-    const answer = `pi-subagent failed: ${String(next.error?.message ?? 'unknown error')}`
+    const answer = `polyagent failed: ${String(next.error?.message ?? 'unknown error')}`
     // The failed hook's beats stay in the response, in block 0.
     return yield* respond(a, e, answer, null, a.beaten ? BEAT.index + 1 : 0, a.handback ? 'handback' : 'text')
   })

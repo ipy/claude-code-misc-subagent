@@ -9,6 +9,7 @@ import {
   type Parser,
   type Gateway,
   type Route,
+  AGY_NOTE,
   AGY_READ_ONLY_SETTINGS,
   AUTH_RESTORE_SCRIPT,
   GATEWAY_SHIM,
@@ -140,7 +141,7 @@ test('defaultRoute: pi when it is installed, else Claude, unless the setting nam
   expect(defaultRoute('gateway', none).kind).toBe('error')
   const bad = defaultRoute('gemini', withPi)
   expect(bad.kind).toBe('error')
-  expect((bad as { error: string }).error).toContain('PI_SUBAGENT_DEFAULT is "gemini"')
+  expect((bad as { error: string }).error).toContain('POLYAGENT_DEFAULT is "gemini"')
 })
 
 test('policyOf: unattended unless guarded is asked for; anything else is an error', () => {
@@ -148,14 +149,14 @@ test('policyOf: unattended unless guarded is asked for; anything else is an erro
   expect(policyOf('')).toBe('bypass')
   expect(policyOf('bypass')).toBe('bypass')
   expect(policyOf(' Guarded ')).toBe('guarded')
-  expect(policyOf('yolo')).toEqual({ error: 'PI_SUBAGENT_PERMISSIONS is "yolo"; use bypass or guarded.' })
+  expect(policyOf('yolo')).toEqual({ error: 'POLYAGENT_PERMISSIONS is "yolo"; use bypass or guarded.' })
 })
 
 // ---- what is installed ----------------------------------------------------------------------
 
 test('detectArgv asks bash for every executable name once, parseDetected reads the answer', () => {
   const argv = detectArgv()
-  expect(argv.slice(0, 4)).toEqual(['bash', '-c', DETECT_SCRIPT, 'pi-subagent'])
+  expect(argv.slice(0, 4)).toEqual(['bash', '-c', DETECT_SCRIPT, 'polyagent'])
   // Each name once: a gateway runs the same claude as claude-code.
   expect(argv.slice(4)).toEqual(['pi', 'claude', 'codex', 'codebuddy-code', 'codebuddy', 'cbc', 'agy', 'opencode'])
   // Only absolute paths count: a shell function or alias of the same name is not an executable.
@@ -194,7 +195,7 @@ test('backendsNote lists what is here with how to name a model, what is missing,
   expect(note).toContain('`Explore@codex/<model>:high`')
   expect(backendsNote(here, { kind: 'claude' })).toContain('Without an `@`, the agent runs on Claude.')
   expect(backendsNote(here, { kind: 'backend', backend: 'codex' })).toContain('runs on Codex CLI.')
-  expect(backendsNote(here, { kind: 'error', error: 'x' })).toContain('PI_SUBAGENT_DEFAULT is not valid')
+  expect(backendsNote(here, { kind: 'error', error: 'x' })).toContain('POLYAGENT_DEFAULT is not valid')
   const all = new Map(BACKEND_IDS.map(id => [id, BACKENDS[id].bins[0]!] as const))
   expect(backendsNote(all, PI)).not.toContain('Not installed')
   expect(backendsNote(new Map(), { kind: 'claude' })).toContain('None of the supported agent CLIs is installed here')
@@ -299,19 +300,21 @@ test('codex: a resume names the thread after the flags, a model and effort are o
   expect(argv('codex').some(a => a.startsWith('model_reasoning_effort'))).toBe(false)
 })
 
-test('agy: the prompt is one argument bound to its flag, writes need the bypass flag it only gets unattended', () => {
+test('agy: the prompt is one argument bound to its flag; read-only denies its writing tools and keeps its shell', () => {
   const fresh = argv('agy')
   expect(fresh).toEqual(['agy', '--output-format=stream-json', '--dangerously-skip-permissions', '--prompt=the task'])
   const resumed = argv('agy', { session: 'conv-1', model: 'Gemini 3.8 Flash (High)', effort: 'minimal' })
   expect(value(resumed, '--conversation')).toBe('conv-1')
   expect(value(resumed, '--model')).toBe('Gemini 3.8 Flash (High)')
   expect(value(resumed, '--effort')).toBe('low')
-  // Without the flag agy's headless mode refuses what needs approval: guarded and read-only.
+  // Guarded: no flag, so headless agy refuses what needs approval.
   expect(argv('agy', { policy: 'guarded' })).not.toContain('--dangerously-skip-permissions')
-  expect(argv('agy', { readOnly: true })).not.toContain('--dangerously-skip-permissions')
-  // Headless agy writes files without asking, so read-only denies writes, commands and MCP tools by rule.
+  // Read-only, whatever the policy: file-writing and MCP tools denied by rule, commands approved
+  // (a request nothing approves would end agy's run, and without commands it cannot even list a folder).
   for (const policy of ['bypass', 'guarded'] as const) {
-    expect(JSON.parse(value(argv('agy', { readOnly: true, policy }), '--settings')!)).toEqual({ permissions: { deny: ['write_file(*)', 'command(*)', 'mcp(*)'] } })
+    const ro = argv('agy', { readOnly: true, policy })
+    expect(JSON.parse(value(ro, '--settings')!)).toEqual({ permissions: { deny: ['write_file(*)', 'mcp(*)'] } })
+    expect(ro).toContain('--dangerously-skip-permissions')
   }
   expect(AGY_READ_ONLY_SETTINGS).toContain('write_file(*)')
   expect(argv('agy').some(a => a.startsWith('--settings'))).toBe(false)
@@ -747,7 +750,7 @@ const SHIM_ARGS = 4
 
 test('gateway: Claude Code started through the shim, which reads the URL and key from the variables the gateway names', () => {
   const a = argv('gateway', { model: 'coding', gateway: GW })
-  expect(a.slice(0, 4)).toEqual(['bash', '-c', GATEWAY_SHIM, 'pi-subagent-gateway'])
+  expect(a.slice(0, 4)).toEqual(['bash', '-c', GATEWAY_SHIM, 'polyagent-gateway'])
   // <base url> <base url variable> <key variable> <variable for the key>
   expect(a.slice(4, 4 + SHIM_ARGS)).toEqual(['', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
   expect(a.slice(8)).toEqual([
@@ -856,4 +859,11 @@ test('the login restore unpacks saved logins once, never over existing files, an
   expect(AUTH_RESTORE_SCRIPT).toContain('restored-$kind')
   expect(AUTH_RESTORE_SCRIPT).toContain('for kind in agy codex')
   expect(AUTH_RESTORE_SCRIPT).not.toMatch(/echo[^;]*\$v\b/)
+})
+
+test('agy is told to do the work itself; read-only leads with the read-only note', () => {
+  expect(promptFor(BACKENDS.agy, { prompt: 'task', readOnly: false })).toBe(`${AGY_NOTE}\n\ntask`)
+  expect(promptFor(BACKENDS.agy, { prompt: 'task', readOnly: true })).toBe(`${READ_ONLY_NOTE_ANY} ${AGY_NOTE}\n\ntask`)
+  expect(AGY_NOTE).toContain('do not start or delegate to subagents')
+  expect(promptFor(BACKENDS.codex, { prompt: 'task', readOnly: false })).toBe('task')
 })
