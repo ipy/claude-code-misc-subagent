@@ -261,6 +261,9 @@ async function readEnv($: EngineInterface) {
   return {
     // Set by the wrapper in every CLI it starts: a Claude Code started that way does not route its own subagents again.
     nested: set(await $.env.get('PI_SUBAGENT_NESTED')) !== undefined,
+    // The engine's own switches for subagents' hand-back tool (see handbackFor).
+    noHandback: set(await $.env.get('CLAUDE_CODE_DISABLE_SUBAGENT_HANDBACK')),
+    handback: set(await $.env.get('CLAUDE_CODE_SENDMESSAGE_HANDBACK')),
     fallback: set(await $.env.get('PI_SUBAGENT_DEFAULT')),
     permissions: set(await $.env.get('PI_SUBAGENT_PERMISSIONS')),
   }
@@ -314,6 +317,8 @@ type Kept = {
   worked?: boolean
   // It moved to Claude itself (a role's last target): its steps go to this model.
   native?: string
+  // Its report is delivered through the engine's SubagentHandback tool, not as its last words.
+  handback?: boolean
 }
 
 // Where an agent runs now, as a role target.
@@ -357,6 +362,9 @@ type Agent = Kept & {
   events: Activity[]
   seq: number
   stats: RunStats
+  // What this turn already answered, and how: a later step of the same turn gives it again
+  // instead of running the backend again (the engine asks again when a report did not arrive).
+  answered?: { turnId: string; text: string; via: 'handback' | 'text'; tries: number }
   // User rows the engine appended to the agent's conversation since its last step.
   inbox: string[]
   watch?: Watch
@@ -369,6 +377,9 @@ type Agent = Kept & {
 type Asked = Omit<Kept, 'id' | 'description'>
 
 const asked = new Map<string, Asked>()
+// Messages for agents whose spawn has not come back yet, by agent id.
+const early = new Map<string, string[]>()
+const EARLY_KEEP_MS = 60_000
 const agents = new Map<string, Agent>()
 const sections = new Map<string, { text: string; cursor: number }>()
 let delivering = false
@@ -432,6 +443,7 @@ async function keep($: EngineInterface, a: Agent) {
     fallbacks: a.fallbacks,
     worked: a.worked,
     native: a.native,
+    handback: a.handback,
   }
   await $.store.set(`agent:${a.id}`, kept)
 }
@@ -924,6 +936,35 @@ const textOf = (content: readonly { type: string; text?: string }[]) =>
     .join('\n')
     .trim()
 
+// The engine's tool for a subagent's report, in the permission mode that has one: a report given
+// as the last words instead is not delivered, and the engine asks the agent again.
+const HANDBACK = 'SubagentHandback'
+
+const truthy = (v: string | undefined) => v !== undefined && !/^(0|false|no|off)$/i.test(v)
+
+// Whether a subagent spawned in this permission mode reports through SubagentHandback: the engine
+// arms it in auto mode unless CLAUDE_CODE_DISABLE_SUBAGENT_HANDBACK is set, and
+// CLAUDE_CODE_SENDMESSAGE_HANDBACK, when set, decides.
+function handbackFor(mode: string | undefined, env: { noHandback?: string; handback?: string }): boolean {
+  if (mode !== 'auto' || truthy(env.noHandback)) return false
+  return env.handback === undefined ? true : truthy(env.handback)
+}
+
+type StepResult = { turnId: string; index: number; answer: string; toolUses: { name: string; input: unknown }[]; stopReason: 'end_turn' | 'tool_use'; usage: ReturnType<typeof usageOf> }
+
+// Gives the step's answer: as the agent's last words, or as its SubagentHandback call.
+async function* respond(a: Agent, e: { turnId: string; index: number }, text: string, usage: ReturnType<typeof usageOf>, after: number, via: 'handback' | 'text', tries = 1) {
+  a.answered = { turnId: e.turnId, text, via, tries }
+  if (via === 'text') {
+    yield { kind: 'text' as const, index: after, text }
+    return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage } satisfies StepResult
+  }
+  const input = { message: text }
+  yield { kind: 'tool' as const, index: after, id: `toolu_pisub_${a.id}_${e.index}_${tries}`, name: HANDBACK }
+  yield { kind: 'input' as const, index: after, json: JSON.stringify(input) }
+  return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name: HANDBACK, input }], stopReason: 'tool_use', usage } satisfies StepResult
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -1115,11 +1156,16 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     const ask = asked.get(e.tool_use_id)
+    // Read before the spawn: once the engine has made the agent it appends its prompt at once, and
+    // the agent must be known by then (nothing is awaited between the spawn and keeping it).
+    const env = ask ? await readEnv($) : undefined
     const spawned = await next(e)
-    if (ask && !e.fork && spawned.agentId) {
+    if (ask && env && !e.fork && spawned.agentId) {
       const now = Date.now()
       const a: Agent = {
         ...ask,
+        // The subagent inherits its parent's permission mode, which decides how it must report.
+        handback: handbackFor(e.permissionMode, env),
         id: spawned.agentId,
         description: e.description,
         status: 'idle',
@@ -1128,8 +1174,9 @@ export const register: Register = on => {
         events: [],
         seq: 1,
         stats: newStats(),
-        inbox: [],
+        inbox: early.get(spawned.agentId) ?? [],
       }
+      early.delete(a.id)
       agents.set(a.id, a)
       await keep($, a)
     }
@@ -1158,10 +1205,16 @@ export const register: Register = on => {
     const stored = await next(e)
     const toAgent = e.agentId && !stored.deny && e.message.type === 'user' && e.message.role === 'user' && e.door !== 'tool-result' && e.door !== 'note'
     // A resume after a reload appends its message before the agent's step loads it from the store.
-    const a = toAgent ? await findKept($, e.agentId!) : undefined
-    if (a) {
-      const text = textOf(e.message.content as { type: string; text?: string }[])
-      if (text) a.inbox.push(text)
+    const text = toAgent ? textOf(e.message.content as { type: string; text?: string }[]) : ''
+    // Looked up again after the wait: the agent's spawn may have registered it meanwhile.
+    const a = toAgent ? ((await findKept($, e.agentId!)) ?? agents.get(e.agentId!)) : undefined
+    if (a && text) a.inbox.push(text)
+    // The engine can append an agent's prompt before its spawn has come back to this mod: while one
+    // of this mod's Agent calls is under way, it is kept for a while, and the agent takes it when
+    // the spawn registers it.
+    else if (toAgent && text && asked.size > 0) {
+      early.set(e.agentId!, [...(early.get(e.agentId!) ?? []), text])
+      $.clock.after(EARLY_KEEP_MS, () => early.delete(e.agentId!))
     }
     return stored
   })
@@ -1187,6 +1240,15 @@ export const register: Register = on => {
     if (!a) return yield* next(e)
     // An agent that moved to Claude itself stays there.
     if (a.native) return yield* next({ ...e, model: a.native })
+    // A later step of a turn the backend has answered: the engine asks again because the report
+    // did not arrive (its nudge after plain last words, or a hand-back it could not take). The
+    // answer is given again in the other form; the backend is not run again.
+    const prev = a.answered
+    if (prev && prev.turnId === e.turnId) {
+      a.inbox.splice(0)
+      const via = prev.via === 'handback' || prev.tries >= 2 || !a.handback ? 'text' : 'handback'
+      return yield* respond(a, e, prev.text, null, 0, via, prev.tries + 1)
+    }
     // The backend's own activity records the message as a user row.
     const message = a.inbox.splice(0).join('\n\n') || 'Continue.'
     let beats = 0
@@ -1229,15 +1291,14 @@ export const register: Register = on => {
     const onClaude = a.native ? `\n\n[the next message to this agent runs on Claude (${a.native})]` : ''
     const answer = `${answerOf(a, Boolean(a.native)) || `(${labelOf(a)} gave no text)`}${failedOver}${onClaude}`
     // The answer is the block after the beats' (one block holds one kind of piece).
-    yield { kind: 'text', index: beats ? BEAT.index + 1 : 0, text: answer }
-    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: usageOf(a) }
+    return yield* respond(a, e, answer, usageOf(a), beats ? BEAT.index + 1 : 0, a.handback ? 'handback' : 'text')
   }).catch(async function* ($, e, next) {
     // An agent run by another backend never falls back to a Claude request.
     if (!e.agentId || !agents.has(e.agentId)) return yield* next(e)
+    const a = agents.get(e.agentId)!
     const answer = `pi-subagent failed: ${String(next.error?.message ?? 'unknown error')}`
     // The failed hook's beats stay in the response, in block 0.
-    yield { kind: 'text', index: agents.get(e.agentId)?.beaten ? BEAT.index + 1 : 0, text: answer }
-    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
+    return yield* respond(a, e, answer, null, a.beaten ? BEAT.index + 1 : 0, a.handback ? 'handback' : 'text')
   })
 
   // A message to an agent while pi works steers pi. Any other backend reads its prompt once,
