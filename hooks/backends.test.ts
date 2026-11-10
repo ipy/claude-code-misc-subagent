@@ -7,7 +7,11 @@ import {
   type Ev,
   type Launch,
   type Parser,
+  type Gateway,
   type Route,
+  AGY_READ_ONLY_SETTINGS,
+  AUTH_RESTORE_SCRIPT,
+  GATEWAY_SHIM,
   backendsNote,
   defaultRoute,
   detectArgv,
@@ -32,7 +36,10 @@ test('every backend id has an entry that names itself, with a unique label and e
     expect(BACKENDS[id].bins.length).toBeGreaterThan(0)
   }
   expect(new Set(BACKEND_IDS.map(id => BACKENDS[id].label)).size).toBe(BACKEND_IDS.length)
-  expect(new Set(BACKEND_IDS.flatMap(id => BACKENDS[id].bins)).size).toBe(BACKEND_IDS.flatMap(id => BACKENDS[id].bins).length)
+  // A gateway is Claude Code pointed elsewhere: the one backend that shares an executable.
+  const own = BACKEND_IDS.filter(id => id !== 'gateway').flatMap(id => BACKENDS[id].bins)
+  expect(new Set(own).size).toBe(own.length)
+  expect(BACKENDS.gateway.bins).toEqual(BACKENDS['claude-code'].bins)
   expect(isBackendId('claude')).toBe(false)
   expect(isBackendId('gemini')).toBe(false)
 })
@@ -128,7 +135,9 @@ test('defaultRoute: pi when it is installed, else Claude, unless the setting nam
   expect(defaultRoute('Native', withPi)).toEqual({ kind: 'claude' })
   expect(defaultRoute('pi', none)).toEqual({ kind: 'pi' })
   expect(defaultRoute(' Codex ', none)).toEqual({ kind: 'backend', backend: 'codex' })
-  for (const id of BACKEND_IDS.filter(x => x !== 'pi')) expect(defaultRoute(id, none)).toEqual({ kind: 'backend', backend: id })
+  for (const id of BACKEND_IDS.filter(x => x !== 'pi' && x !== 'gateway')) expect(defaultRoute(id, none)).toEqual({ kind: 'backend', backend: id })
+  // A gateway is named by its own name, which only the configuration knows.
+  expect(defaultRoute('gateway', none).kind).toBe('error')
   const bad = defaultRoute('gemini', withPi)
   expect(bad.kind).toBe('error')
   expect((bad as { error: string }).error).toContain('PI_SUBAGENT_DEFAULT is "gemini"')
@@ -147,10 +156,13 @@ test('policyOf: unattended unless guarded is asked for; anything else is an erro
 test('detectArgv asks bash for every executable name once, parseDetected reads the answer', () => {
   const argv = detectArgv()
   expect(argv.slice(0, 4)).toEqual(['bash', '-c', DETECT_SCRIPT, 'pi-subagent'])
+  // Each name once: a gateway runs the same claude as claude-code.
   expect(argv.slice(4)).toEqual(['pi', 'claude', 'codex', 'codebuddy-code', 'codebuddy', 'cbc', 'agy', 'opencode'])
   // Only absolute paths count: a shell function or alias of the same name is not an executable.
   expect(DETECT_SCRIPT).toContain('command -v')
   expect(DETECT_SCRIPT).toContain('case "$p" in /*)')
+  // The loop's status would be the last name's: a missing last CLI must not void the answer.
+  expect(DETECT_SCRIPT.endsWith('; exit 0')).toBe(true)
 })
 
 test('parseDetected: the first executable name of each backend that is present', () => {
@@ -203,6 +215,8 @@ test('promptFor: a command-looking prompt gets a line before it; a read-only not
 })
 
 // ---- starting each CLI ----------------------------------------------------------------------
+
+const GW: Gateway = { name: 'mygw', baseUrlEnv: 'MYGW_BASE_URL', keyEnv: 'MYGW_API_KEY', auth: 'api-key', models: ['coding'], env: { CLAUDE_CODE_EFFORT_LEVEL: 'max' } }
 
 const launch = (patch: Partial<Launch> = {}): Launch => ({ bin: 'x', prompt: 'the task', file: '/p', readOnly: false, policy: 'bypass', ...patch })
 const argv = (id: BackendId, patch: Partial<Launch> = {}) => BACKENDS[id].argv(launch({ bin: BACKENDS[id].bins[0]!, ...patch }))
@@ -295,6 +309,12 @@ test('agy: the prompt is one argument bound to its flag, writes need the bypass 
   // Without the flag agy's headless mode refuses what needs approval: guarded and read-only.
   expect(argv('agy', { policy: 'guarded' })).not.toContain('--dangerously-skip-permissions')
   expect(argv('agy', { readOnly: true })).not.toContain('--dangerously-skip-permissions')
+  // Headless agy writes files without asking, so read-only denies writes, commands and MCP tools by rule.
+  for (const policy of ['bypass', 'guarded'] as const) {
+    expect(JSON.parse(value(argv('agy', { readOnly: true, policy }), '--settings')!)).toEqual({ permissions: { deny: ['write_file(*)', 'command(*)', 'mcp(*)'] } })
+  }
+  expect(AGY_READ_ONLY_SETTINGS).toContain('write_file(*)')
+  expect(argv('agy').some(a => a.startsWith('--settings'))).toBe(false)
   // A prompt that looks like a flag is still only the value of --prompt.
   expect(argv('agy', { prompt: '--help' }).at(-1)).toBe('--prompt=--help')
 })
@@ -315,11 +335,14 @@ test('opencode: run with JSON events, the prompt after "--", read-only by denyin
 
 test('a model name stays one argument for every backend that takes one', () => {
   const name = 'odd name; rm -rf / "x" $(y)'
-  for (const id of BACKEND_IDS.filter(x => x !== 'pi')) {
+  for (const id of BACKEND_IDS.filter(x => x !== 'pi' && x !== 'gateway')) {
     const a = argv(id, { model: name })
     expect(a.filter(x => x.includes('rm -rf')).length).toBe(1)
     expect(a.some(x => x === `--model=${name}`)).toBe(true)
   }
+  // A gateway also names it in each of Claude Code's model variables, each one whole argument.
+  const g = argv('gateway', { model: name, gateway: GW })
+  expect(g.filter(x => x.includes('rm -rf')).every(x => x === `--model=${name}` || /^[A-Z_]+_MODEL=/.test(x))).toBe(true)
 })
 
 test('a prompt reaches only the backends that take it as an argument, and then as the value of one', () => {
@@ -716,4 +739,121 @@ test('every parser survives events of the wrong shape', () => {
     const stats = newStats()
     for (const ev of junk) expect(() => parser(ev, stats)).not.toThrow()
   }
+})
+
+// ---- gateways: Claude Code on an Anthropic-compatible API ------------------------------------
+
+const SHIM_ARGS = 4
+
+test('gateway: Claude Code started through the shim, which reads the URL and key from the variables the gateway names', () => {
+  const a = argv('gateway', { model: 'coding', gateway: GW })
+  expect(a.slice(0, 4)).toEqual(['bash', '-c', GATEWAY_SHIM, 'pi-subagent-gateway'])
+  // <base url> <base url variable> <key variable> <variable for the key>
+  expect(a.slice(4, 4 + SHIM_ARGS)).toEqual(['', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
+  expect(a.slice(8)).toEqual([
+    'env',
+    'CLAUDE_CODE_EFFORT_LEVEL=max',
+    'ANTHROPIC_MODEL=coding',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL=coding',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL=coding',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL=coding',
+    'CLAUDE_CODE_SUBAGENT_MODEL=coding',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
+    'claude',
+    '-p',
+    '--output-format=stream-json',
+    '--verbose',
+    '--model=coding',
+    '--dangerously-skip-permissions',
+  ])
+  expect(stdinOf(BACKENDS.gateway)).toBe('file')
+})
+
+test('gateway: the shim drops the session\'s own credentials and CLAUDE_CODE_REMOTE, and stops when a variable is missing', () => {
+  for (const v of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_REMOTE']) expect(GATEWAY_SHIM).toContain(v)
+  expect(GATEWAY_SHIM).toContain('unset ')
+  expect(GATEWAY_SHIM).toContain('${!2:-}')
+  expect(GATEWAY_SHIM).toContain('${!3:-}')
+  expect(GATEWAY_SHIM).toContain('exit 78')
+  expect(GATEWAY_SHIM.endsWith('exec "$@"')).toBe(true)
+  // Only variable names are ever passed: the shim never echoes a value.
+  expect(GATEWAY_SHIM).not.toMatch(/echo[^;]*\$(url|key)\b/)
+})
+
+test('gateway: a literal URL, bearer auth, no key, the default model, read-only, resume and effort', () => {
+  const g: Gateway = { name: 'local', baseUrl: 'http://localhost:4000', auth: 'bearer', model: 'qwen', models: [], env: {} }
+  const a = argv('gateway', { gateway: g, readOnly: true, session: 'fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d', effort: 'minimal' })
+  expect(a.slice(4, 8)).toEqual(['http://localhost:4000', '', '', 'ANTHROPIC_AUTH_TOKEN'])
+  expect(a).toContain('ANTHROPIC_MODEL=qwen')
+  expect(value(a, '--model')).toBe('qwen')
+  expect(value(a, '--tools')).toBe('Read,Grep,Glob,LS')
+  expect(value(a, '--resume')).toBe('fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d')
+  expect(value(a, '--effort')).toBe('low')
+  expect(a).not.toContain('--dangerously-skip-permissions')
+  // No model anywhere: Claude Code's own.
+  const bare = argv('gateway', { gateway: { ...g, model: undefined } })
+  expect(bare.some(x => x.startsWith('ANTHROPIC_MODEL') || x.startsWith('--model'))).toBe(false)
+  expect(() => argv('gateway')).toThrow()
+})
+
+test('parseRoute: configured gateways and roles, after the agents; claude/<model> is Claude with a model', () => {
+  const names = { gateways: new Set(['mygw']), roles: new Set(['explore']) }
+  const r = (s: string) => parseRoute(s, PI, names)
+  expect(r('mygw/coding')).toEqual({ kind: 'backend', backend: 'gateway', gateway: 'mygw', model: 'coding', level: undefined })
+  expect(r('MyGW/explore:high')).toEqual({ kind: 'backend', backend: 'gateway', gateway: 'mygw', model: 'explore', level: 'high' })
+  expect(r('mygw/openai/gpt-x')).toEqual({ kind: 'backend', backend: 'gateway', gateway: 'mygw', model: 'openai/gpt-x', level: undefined })
+  expect(r('mygw')).toEqual({ kind: 'backend', backend: 'gateway', gateway: 'mygw', model: undefined, level: undefined })
+  expect(r('mygw:fast').kind).toBe('error')
+  expect(r('explore')).toEqual({ kind: 'role', role: 'explore', level: undefined })
+  expect(r('explore:high')).toEqual({ kind: 'role', role: 'explore', level: 'high' })
+  expect(r('explore/x').kind).toBe('error')
+  expect(r('claude')).toEqual({ kind: 'claude' })
+  expect(r('claude/Haiku')).toEqual({ kind: 'claude', model: 'haiku' })
+  expect(r('claude/gpt').kind).toBe('error')
+  expect(r('claude:high').kind).toBe('error')
+  expect(r('gateway/x').kind).toBe('error')
+  expect((r('gateway/x') as { error: string }).error).toContain('mygw')
+  // Unknown names are still pi models; without a configuration gateways are not known.
+  expect(r('acme/model')).toEqual({ kind: 'pi', requested: 'acme/model' })
+  expect(parseRoute('mygw/coding', PI)).toEqual({ kind: 'pi', requested: 'mygw/coding' })
+  expect(r('codex/gpt-5.5')).toEqual({ kind: 'backend', backend: 'codex', model: 'gpt-5.5', level: undefined })
+})
+
+test('backendsNote leaves gateways to the configuration\'s own note, and names a role or gateway default', () => {
+  const here = new Map<BackendId, string>([['claude-code', 'claude'], ['gateway', 'claude']])
+  const note = backendsNote(here, { kind: 'role', role: 'explore' })
+  expect(note).toContain('Without an `@`, the agent runs on the explore role.')
+  expect(note).not.toContain('`@gateway`')
+  expect(note).not.toContain('gateway,')
+  expect(backendsNote(here, { kind: 'backend', backend: 'gateway', gateway: 'mygw' })).toContain('runs on the mygw gateway.')
+})
+
+// `claude -p --output-format=stream-json --verbose --model explore --tools=Read,Grep,Glob,LS` against an
+// Anthropic-compatible gateway (Claude Code 2.1.319), trimmed to the fields that matter; ids and the
+// upstream model name replaced, thinking signatures dropped.
+const GATEWAY_RUN = String.raw`{"type":"system","subtype":"init","cwd":"/tmp/cap","session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d","tools":["Glob","Grep","Read"],"model":"explore","permissionMode":"default","apiKeySource":"ANTHROPIC_API_KEY","claude_code_version":"2.1.319"}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","model":"upstream-model-1","content":[{"type":"thinking","thinking":"The user wants me to read a.txt and tell them its contents in one line.  I'll read the file."}],"stop_reason":null,"usage":{"input_tokens":4854,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d"}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","model":"upstream-model-1","content":[{"type":"tool_use","id":"call_wur43ro2czg8li7rvthpr9yh","name":"Read","input":{"file_path":"/tmp/cap/a.txt"}}],"stop_reason":null,"usage":{"input_tokens":4854,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d"}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"call_wur43ro2czg8li7rvthpr9yh","type":"tool_result","content":"1\thello world\n2\t"}]},"parent_tool_use_id":null,"session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d"}
+{"type":"assistant","message":{"id":"msg_02","type":"message","role":"assistant","model":"upstream-model-1","content":[{"type":"thinking","thinking":"The file contains \"hello world\". Report it in line."}],"stop_reason":null,"usage":{"input_tokens":272,"cache_creation_input_tokens":0,"cache_read_input_tokens":4664,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d"}
+{"type":"assistant","message":{"id":"msg_02","type":"message","role":"assistant","model":"upstream-model-1","content":[{"type":"text","text":"a.txt contains: \"hello world\""}],"stop_reason":null,"usage":{"input_tokens":272,"cache_creation_input_tokens":0,"cache_read_input_tokens":4664,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":7566,"num_turns":2,"result":"a.txt contains: \"hello world\"","stop_reason":"end_turn","session_id":"fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d","total_cost_usd":0.030187,"usage":{"input_tokens":5126,"cache_creation_input_tokens":0,"cache_read_input_tokens":4664,"output_tokens":89},"modelUsage":{"explore":{"inputTokens":5126,"outputTokens":89,"cacheReadInputTokens":4664,"cacheCreationInputTokens":0,"costUSD":0.030187,"contextWindow":200000}},"permission_denials":[]}`.split('\n').map(line => JSON.parse(line) as Ev)
+
+test('gateway: a real run reads as a Claude Code run: the tool, the answer, usage under the alias, the session', () => {
+  const { stats, items } = read(BACKENDS.gateway.parser(), GATEWAY_RUN)
+  expect(stats.session).toBe('fc0c2db6-5ae9-46df-9a0c-f4cdc67c346d')
+  expect(stats.model).toBe('explore')
+  expect(stats.answer).toBe('a.txt contains: "hello world"')
+  expect(stats.steps).toBe(1)
+  expect(stats.settled).toBe(true)
+  expect(stats.error).toBeUndefined()
+  expect(stats.usage).toEqual({ input: 5126, output: 89, cacheRead: 4664, cacheWrite: 0 })
+  expect(items.map(i => i.kind)).toEqual(['tool', 'result', 'text'])
+})
+
+test('the login restore unpacks saved logins once, never over existing files, and never prints a value', () => {
+  expect(AUTH_RESTORE_SCRIPT).toContain('--skip-old-files')
+  expect(AUTH_RESTORE_SCRIPT).toContain('restored-$kind')
+  expect(AUTH_RESTORE_SCRIPT).toContain('for kind in agy codex')
+  expect(AUTH_RESTORE_SCRIPT).not.toMatch(/echo[^;]*\$v\b/)
 })

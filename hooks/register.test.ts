@@ -1,6 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { DETECT_SCRIPT } from './backends'
+import { AUTH_RESTORE_SCRIPT, DETECT_SCRIPT, GATEWAY_SHIM } from './backends'
+import { ENV_SET_SCRIPT } from './routing'
 import { READ_ONLY_NOTE_ANY } from './core'
 
 // The test runtime has timers; the module's own types do not declare them.
@@ -46,6 +47,8 @@ type World = {
   writes: Map<string, string>
   submitted: string[]
   claudeSteps: number
+  // The model each step sent to Claude named.
+  claudeModels: string[]
   spawned: string[]
   // Holds `pi --list-models` until it settles, like a cold pi.
   listGate?: Promise<void>
@@ -71,7 +74,7 @@ let settings = SETTINGS
 
 const ok = (stdout = '', exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
-function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<string, string>; installed?: string[] } = {}): World {
+function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<string, string>; installed?: string[]; files?: Record<string, string> } = {}): World {
   const w: World = {
     root: '/repo',
     cwd: '/repo',
@@ -82,6 +85,7 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
     writes: new Map(),
     submitted: [],
     claudeSteps: 0,
+    claudeModels: [],
     spawned: [],
     agentCalls: [],
     pi: {},
@@ -119,9 +123,9 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
   })
   on('session.start', () => ({ cwd: '/repo' }) as never)
   on('ui.log', () => ({ value: undefined }))
-  on('fs.exists', ($, e) => ({ value: e.path === `${HOME}/.pi/agent/settings.json` }))
+  on('fs.exists', ($, e) => ({ value: e.path === `${HOME}/.pi/agent/settings.json` || e.path in (opts.files ?? {}) }))
   settings = SETTINGS
-  on('fs.read', ($, e) => ({ value: e.path === `${HOME}/.pi/agent/settings.json` ? settings : '' }))
+  on('fs.read', ($, e) => ({ value: e.path === `${HOME}/.pi/agent/settings.json` ? settings : (opts.files ?? {})[e.path] ?? '' }))
   on('fs.write', ($, e) => {
     w.writes.set(e.path, e.text)
     return { value: undefined }
@@ -133,6 +137,10 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
     if (cmd === 'pwd') return ok(`${w.cwd}\n`)
     if (cmd === 'bash' && rest[0] === '-c' && rest[1] === DETECT_SCRIPT) {
       return ok(rest.slice(3).filter(name => w.installed.has(name)).map(name => `${name}\t/usr/local/bin/${name}\n`).join(''))
+    }
+    // Which of the named variables are set, as bash would answer from the environment.
+    if (cmd === 'bash' && rest[0] === '-c' && rest[1] === ENV_SET_SCRIPT) {
+      return ok(rest.slice(3).filter(v => (opts.env ?? {})[v]).map(v => `${v}\n`).join(''))
     }
     if (cmd === 'pi' && rest[0] === '--list-models') {
       await w.listGate
@@ -226,6 +234,7 @@ function world(on: On, stored?: Record<string, unknown>, opts: { env?: Record<st
   on('tool.call', { tool: 'SendMessage' }, () => ({ result: { success: true, message: 'engine delivered' } }) as never)
   on('turn.step', async function* ($, e) {
     w.claudeSteps += 1
+    w.claudeModels.push(e.model)
     yield { kind: 'text' as const, index: 0, text: 'CLAUDE' }
     return { turnId: e.turnId, index: e.index, answer: 'CLAUDE', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
@@ -1372,4 +1381,202 @@ test('a nested CLI gets no toasts at session start', async ($, on) => {
   await $.session.start({ cwd: '/repo' } as never)
   await sleep(50)
   expect(w.toasts).toEqual([])
+})
+
+// ---- gateways and roles ----------------------------------------------------------------------
+
+const GW_ENV = { MYGW_BASE_URL: 'https://private.example/anthropic', MYGW_API_KEY: 'sk-SECRET-gw-7' }
+const CONFIG = JSON.stringify({
+  gateways: { mygw: { baseUrlEnv: 'MYGW_BASE_URL', keyEnv: 'MYGW_API_KEY', models: ['coding', 'explore'] } },
+  roles: {
+    explore: { type: 'Explore', targets: ['mygw/explore', 'agy/gemini-3.8-flash', 'claude/haiku'] },
+    coding: { targets: ['mygw/coding'] },
+  },
+})
+const withConfig = (extra: Record<string, string> = {}) => ({ env: { PI_SUBAGENT_CONFIG: CONFIG, ...GW_ENV, ...extra } })
+
+// What Claude Code prints when the gateway refuses it (as seen live): an init, the error as its words, a failed result.
+const gatewayRefused: CliScript = [
+  out({ type: 'system', subtype: 'init', session_id: 'sess-gw-x', model: 'explore' }),
+  // Claude Code tells an API failure as an assistant message too, before the failed result.
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: 'API Error: 401 invalid x-api-key' }] } }),
+  out({ type: 'result', subtype: 'success', is_error: true, result: 'API Error: 401 invalid x-api-key', permission_denials: [] }),
+]
+
+test('gateway: Claude Code runs through the shim with only variable names on its command line', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'], ...withConfig() })
+  // The wrapper execs bash (the shim), which execs Claude Code.
+  w.cli.bash = claudeRun('gateway says hi', 'sess-gw-1')
+  await launch($, w, { subagent_type: 'general-purpose@mygw/coding:high' })
+  expect(w.agentCalls[0]?.subagent_type).toBe('general-purpose')
+  const { result } = await step($, 'a1')
+  const cli = cliOf(w.spawns[0]!.argv)
+  expect(cli.slice(0, 8)).toEqual(['bash', '-c', GATEWAY_SHIM, 'pi-subagent-gateway', '', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
+  expect(cli).toContain('ANTHROPIC_MODEL=coding')
+  expect(flag(w.spawns[0]!.argv, '--effort')).toBe('high')
+  // Neither the key nor the private URL is anywhere the mod passes or keeps.
+  for (const secret of Object.values(GW_ENV)) {
+    expect(w.spawns[0]!.argv.join('\n')).not.toContain(secret)
+    expect(JSON.stringify([...w.store.values()])).not.toContain(secret)
+    expect(JSON.stringify([...w.writes.values()])).not.toContain(secret)
+  }
+  expect(result.answer).toContain('gateway says hi')
+  expect(result.answer).toContain('[mygw · claude-opus-5-5 · 1 tool uses')
+  expect(result.usage).toMatchObject({ model: 'mygw/claude-opus-5-5' })
+  expect(w.store.get('agent:a1')).toMatchObject({ backend: 'gateway', gateway: 'mygw', model: 'coding', session: 'sess-gw-1' })
+})
+
+test('gateway: refused with what is missing, and @gateway is not a name', async ($, on) => {
+  const unset = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: CONFIG, MYGW_BASE_URL: 'https://x' } })
+  const r1 = (await launch($, unset, { subagent_type: 'general-purpose@mygw/coding' })) as { deny?: string }
+  expect(r1.deny).toBe('The mygw gateway cannot be used: MYGW_API_KEY is not set.')
+  const r2 = (await launch($, unset, { subagent_type: 'general-purpose@mygw' })) as { deny?: string }
+  expect(r2.deny).toContain('MYGW_API_KEY is not set')
+  const r3 = (await launch($, unset, { subagent_type: 'general-purpose@gateway/x' })) as { deny?: string }
+  expect(r3.deny).toContain('name the gateway itself')
+  expect(unset.spawns.length).toBe(0)
+})
+
+test('gateway: no model and no default is refused', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'], ...withConfig() })
+  const r = (await launch($, w, { subagent_type: 'general-purpose@mygw' })) as { deny?: string }
+  expect(r.deny).toContain('no model: write @mygw/<model>')
+})
+
+test('a role runs on its first usable target, with its own agent type when the call names none', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig({ MYGW_API_KEY: '' }) })
+  w.cli.agy = agyRun('agy explored')
+  await launch($, w, { subagent_type: '@explore' })
+  // The gateway's key is not set, so agy comes first; the engine is told the role's type.
+  expect(w.agentCalls[0]?.subagent_type).toBe('Explore')
+  const { result } = await step($, 'a1')
+  expect(cliOf(w.spawns[0]!.argv)[0]).toBe('agy')
+  expect(flag(w.spawns[0]!.argv, '--settings')).toContain('write_file(*)')
+  expect(result.answer).toContain('agy explored')
+  // Once it has worked it stays on agy: nothing is left to fail over to.
+  expect(w.store.get('agent:a1')).toMatchObject({ role: 'explore', backend: 'agy', readOnly: true, worked: true })
+  expect((w.store.get('agent:a1') as { fallbacks?: unknown }).fallbacks).toBeUndefined()
+})
+
+test('a role whose targets cannot start fails over to the next, and remembers the failure', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig() })
+  w.cli.bash = gatewayRefused
+  w.cli.agy = agyRun('agy after the gateway')
+  await launch($, w, { subagent_type: 'Explore@explore' })
+  const { result } = await step($, 'a1')
+  expect(w.spawns.map(s => cliOf(s.argv)[0])).toEqual(['bash', 'agy'])
+  expect(result.answer).toContain('agy after the gateway')
+  expect(result.answer).toContain('[role explore: could not start mygw/explore: API Error: 401 invalid x-api-key]')
+  expect(w.store.get('agent:a1')).toMatchObject({ backend: 'agy', worked: true })
+  expect((w.store.get('health') as Record<string, { error: string }>)['mygw/explore']?.error).toContain('401')
+  // The next call leaves the failed target out for now, and says why in the description.
+  await launch($, w, { subagent_type: '@explore' })
+  await step($, 'a2')
+  expect(cliOf(w.spawns.at(-1)!.argv)[0]).toBe('agy')
+  const d = await describeAgent($)
+  expect(d.description).toContain('`@explore` (Explore): agy/gemini-3.8-flash → claude/haiku; skipped mygw/explore: could not start')
+  // Named directly, a gateway is tried whatever its record.
+  w.cli.bash = claudeRun('back up', 'sess-gw-2')
+  await launch($, w, { subagent_type: 'Explore@mygw/explore' })
+  const direct = await step($, 'a3')
+  expect(direct.result.answer).toContain('back up')
+  expect((w.store.get('health') as Record<string, unknown>)['mygw/explore']).toBeUndefined()
+})
+
+test('a role whose CLIs all fail hands the step to Claude with the role\'s model, and its later turns too', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'], ...withConfig() })
+  w.cli.bash = gatewayRefused
+  await launch($, w, { subagent_type: '@explore' })
+  const { texts, result } = await step($, 'a1')
+  expect(w.claudeSteps).toBe(1)
+  expect(w.claudeModels).toEqual(['haiku'])
+  expect(texts).toEqual(['CLAUDE'])
+  expect(result.answer).toBe('CLAUDE')
+  expect(w.store.get('agent:a1')).toMatchObject({ native: 'haiku' })
+  await step($, 'a1')
+  expect(w.claudeModels).toEqual(['haiku', 'haiku'])
+  expect(w.spawns.length).toBe(1)
+})
+
+test('a role with nothing usable is refused with the reasons, and one whose first is Claude goes to Claude', async ($, on) => {
+  const cfg = JSON.stringify({ roles: { solo: ['mygw/coding'], deep: ['claude/opus', 'codex'] }, gateways: { mygw: { baseUrlEnv: 'MYGW_BASE_URL' } } })
+  const w = world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: cfg } })
+  const r = (await launch($, w, { subagent_type: '@solo' })) as { deny?: string }
+  expect(r.deny).toContain('Nothing the solo role names can be used now: mygw/coding: MYGW_BASE_URL is not set')
+  await launch($, w, { subagent_type: 'Plan@deep' })
+  expect(w.agentCalls.at(-1)).toMatchObject({ subagent_type: 'Plan', model: 'opus' })
+})
+
+test('a failure after the agent has worked does not move it: its session belongs to that backend', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig() })
+  w.cli.bash = claudeRun('first', 'sess-gw-1')
+  await launch($, w, { subagent_type: '@explore' })
+  await step($, 'a1')
+  w.cli.bash = gatewayRefused
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'text', text: 'more' }] },
+    door: 'delivery',
+    origin: { kind: 'tool', tool: 'SendMessage' },
+    uuid: 'u-more',
+    agentId: 'a1',
+  } as never)
+  const { result } = await step($, 'a1')
+  expect(w.spawns.map(s => cliOf(s.argv)[0])).toEqual(['bash', 'bash'])
+  expect(result.answer).toContain('mygw failed')
+  expect(w.claudeSteps).toBe(0)
+})
+
+test('the configuration file is read, the variable over it; problems are told at session start and in the description', async ($, on) => {
+  const w = world(on, undefined, {
+    installed: ['claude'],
+    env: { ...GW_ENV, PI_SUBAGENT_CONFIG: JSON.stringify({ roles: { coding: ['mygw/coding'] }, gateways: { codex: { baseUrl: 'x' } } }) },
+    files: { [`${HOME}/.claude/pi-subagent/config.json`]: CONFIG },
+  })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(w.toasts.some(t => t.includes('"codex" already means an agent'))).toBe(true)
+  const d = await describeAgent($)
+  expect(d.description).toContain('`@mygw` · models: `coding`, `explore`')
+  // The variable's coding role replaced the file's; the file's explore role is still there.
+  expect(d.description).toContain('`@coding`: mygw/coding')
+  expect(d.description).toContain('`@explore` (Explore)')
+  expect(d.description).toContain('configuration problems')
+  for (const secret of Object.values(GW_ENV)) expect(d.description).not.toContain(secret)
+})
+
+test('PI_SUBAGENT_DEFAULT can name a role', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude', 'agy'], ...withConfig({ PI_SUBAGENT_DEFAULT: 'explore', MYGW_API_KEY: '' }) })
+  w.cli.agy = agyRun()
+  await launch($, w, { subagent_type: 'general-purpose' })
+  await step($, 'a1')
+  expect(cliOf(w.spawns[0]!.argv)[0]).toBe('agy')
+  const d = await describeAgent($)
+  expect(d.description).toContain('Without an `@`, the agent runs on the explore role.')
+})
+
+test('session start restores saved logins with a script that reads them itself, not when nested', async ($, on) => {
+  const w = world(on, undefined, { installed: ['agy'], env: { AGY_AUTH_B64: 'c2VjcmV0' } })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  const ran = w.runs.filter(a => a[2] === AUTH_RESTORE_SCRIPT)
+  expect(ran.length).toBe(1)
+  expect(ran[0]!.join(' ')).not.toContain('c2VjcmV0')
+})
+
+test('a nested CLI does not restore logins again', async ($, on) => {
+  const w = world(on, undefined, { installed: ['agy'], env: { PI_SUBAGENT_NESTED: '1' } })
+  await $.session.start({ cwd: '/repo' } as never)
+  await sleep(50)
+  expect(w.runs.some(a => a[2] === AUTH_RESTORE_SCRIPT)).toBe(false)
+})
+
+test('PI_SUBAGENT_CONFIG may name a file, and a missing one is a problem', async ($, on) => {
+  const w = world(on, undefined, { installed: ['claude'], env: { ...GW_ENV, PI_SUBAGENT_CONFIG: '~/gw.json' }, files: { [`${HOME}/gw.json`]: CONFIG } })
+  expect((await describeAgent($)).description).toContain('`@mygw`')
+  void w
+})
+
+test('a configured file that is missing is reported', async ($, on) => {
+  world(on, undefined, { installed: ['claude'], env: { PI_SUBAGENT_CONFIG: '/nope.json' } })
+  expect((await describeAgent($)).description).toContain('PI_SUBAGENT_CONFIG: /nope.json does not exist')
 })

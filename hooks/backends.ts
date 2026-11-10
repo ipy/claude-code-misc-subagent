@@ -22,9 +22,9 @@ import {
   textOf,
 } from './core'
 
-export type BackendId = 'pi' | 'claude-code' | 'codex' | 'codebuddy-code' | 'agy' | 'opencode'
+export type BackendId = 'pi' | 'claude-code' | 'gateway' | 'codex' | 'codebuddy-code' | 'agy' | 'opencode'
 
-export const BACKEND_IDS: readonly BackendId[] = ['pi', 'claude-code', 'codex', 'codebuddy-code', 'agy', 'opencode']
+export const BACKEND_IDS: readonly BackendId[] = ['pi', 'claude-code', 'gateway', 'codex', 'codebuddy-code', 'agy', 'opencode']
 
 export const isBackendId = (value: string): value is BackendId => (BACKEND_IDS as readonly string[]).includes(value)
 
@@ -67,6 +67,29 @@ export type Launch = {
   effort?: string
   readOnly: boolean
   policy: Policy
+  // The gateway a `gateway` backend runs against.
+  gateway?: Gateway
+}
+
+// An Anthropic-compatible endpoint that Claude Code is pointed at, as the user configured it
+// (see routing.ts). Nothing secret is in it: the key, and the URL if it is private, are named
+// by the environment variable that holds them, which the CLI's shell reads when it starts.
+export type Gateway = {
+  name: string
+  // The endpoint's base URL as written, or the variable that holds it.
+  baseUrl?: string
+  baseUrlEnv?: string
+  // The variable that holds the key, and how it is sent: `x-api-key` (ANTHROPIC_API_KEY) or a
+  // bearer token (ANTHROPIC_AUTH_TOKEN).
+  keyEnv?: string
+  auth: 'api-key' | 'bearer'
+  // The model when a call names none.
+  model?: string
+  // Model names worth telling the main agent about (aliases the gateway maps, ids).
+  models: string[]
+  // Further variables for the CLI, not secrets (CLAUDE_CODE_EFFORT_LEVEL, ...).
+  env: Record<string, string>
+  description?: string
 }
 
 export type Backend = {
@@ -562,6 +585,47 @@ function claudeLikeArgv(l: Launch, bypass: string, effort: string | undefined): 
   ]
 }
 
+// agy's session-only settings for a read-only run: its permission rules, deny over everything else.
+export const AGY_READ_ONLY_SETTINGS = JSON.stringify({ permissions: { deny: ['write_file(*)', 'command(*)', 'mcp(*)'] } })
+
+// Starts Claude Code against a gateway. The base URL and key are read from the variables the
+// gateway names here, in the CLI's own shell, so neither is on a command line (`ps`) or in what
+// the mod records. The main session's credentials go, and so does CLAUDE_CODE_REMOTE: a child
+// `claude` in a Claude Code cloud session that keeps it and talks to another base URL hangs on
+// the sandbox's agent-proxy CA fetch. Exits 78 when a variable it needs is not set.
+// Arguments: <base url> <base url variable> <key variable> <variable to put the key in> <cli...>
+export const GATEWAY_SHIM =
+  'url="$1"; [ -n "$2" ] && url="${!2:-}"; key=; [ -n "$3" ] && key="${!3:-}"; to="$4"; ' +
+  '[ -n "$url" ] || { echo "the gateway base URL is empty${2:+: $2 is not set}" >&2; exit 78; }; ' +
+  '[ -z "$3" ] || [ -n "$key" ] || { echo "the gateway key is empty: $3 is not set" >&2; exit 78; }; ' +
+  'shift 4; unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_REMOTE; ' +
+  'export ANTHROPIC_BASE_URL="$url"; if [ -n "$key" ]; then export "$to=$key"; fi; exec "$@"'
+
+function gatewayArgv(l: Launch, effort: string | undefined): string[] {
+  const g = l.gateway
+  if (!g) throw new Error('a gateway run needs its gateway')
+  const model = l.model ?? g.model
+  // Every model slot is the one asked for: a gateway alias means nothing to Claude Code's own defaults.
+  const models = model
+    ? ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'].map(v => `${v}=${model}`)
+    : []
+  return [
+    'bash',
+    '-c',
+    GATEWAY_SHIM,
+    'pi-subagent-gateway',
+    g.baseUrl ?? '',
+    g.baseUrlEnv ?? '',
+    g.keyEnv ?? '',
+    g.auth === 'bearer' ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY',
+    'env',
+    ...Object.entries(g.env).map(([k, v]) => `${k}=${v}`),
+    ...models,
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
+    ...claudeLikeArgv({ ...l, bin: 'claude', model }, '--dangerously-skip-permissions', effort),
+  ]
+}
+
 const codexSandbox = (l: Launch) => (l.readOnly ? 'read-only' : l.policy === 'bypass' ? 'danger-full-access' : 'workspace-write')
 
 export const BACKENDS: Record<BackendId, Backend> = {
@@ -591,6 +655,20 @@ export const BACKENDS: Record<BackendId, Backend> = {
     hint: 'a model alias or id such as `sonnet`, `opus` or `claude-opus-4-8`, or a name your `ANTHROPIC_BASE_URL` gateway serves; a separate Claude Code process that inherits the environment',
     effort: level => (level === 'off' ? undefined : level === 'minimal' ? 'low' : level),
     argv: l => claudeLikeArgv(l, '--dangerously-skip-permissions', effortOf(BACKENDS['claude-code'], l)),
+    parser: streamJsonParser,
+  },
+  gateway: {
+    id: 'gateway',
+    label: 'gateway',
+    title: 'Claude Code on an Anthropic-compatible gateway',
+    bins: ['claude'],
+    input: 'stdin',
+    steers: false,
+    persistent: false,
+    systemNote: true,
+    hint: 'a model the gateway serves (an alias it maps, or its own id)',
+    effort: level => (level === 'off' ? undefined : level === 'minimal' ? 'low' : level),
+    argv: l => gatewayArgv(l, effortOf(BACKENDS.gateway, l)),
     parser: streamJsonParser,
   },
   codex: {
@@ -656,7 +734,10 @@ export const BACKENDS: Record<BackendId, Backend> = {
       ...flag('--conversation', l.session),
       ...flag('--model', l.model),
       ...flag('--effort', effortOf(BACKENDS.agy, l)),
-      // Without the flag agy's headless mode refuses whatever needs approval, writes first.
+      // Read-only: headless agy refuses commands by itself but writes files freely (seen with
+      // agy 1.5.3), so writes, commands and MCP tools are denied for this run; reads stay allowed.
+      ...(l.readOnly ? [`--settings=${AGY_READ_ONLY_SETTINGS}`] : []),
+      // Without the flag agy's headless mode refuses what needs approval (commands); file writes do not need it.
       ...(!l.readOnly && l.policy === 'bypass' ? ['--dangerously-skip-permissions'] : []),
       `--prompt=${l.prompt}`,
     ],
@@ -696,11 +777,23 @@ export const BACKENDS: Record<BackendId, Backend> = {
 
 // Where an Agent call goes.
 export type Route =
-  | { kind: 'claude' }
+  // Claude itself; `model` is the Agent tool's model parameter (opus, sonnet, haiku, fable).
+  | { kind: 'claude'; model?: string }
   // `requested` is what pi is asked for, in pi's own syntax (`provider/model[:thinking]`, `default[:thinking]`).
   | { kind: 'pi'; requested?: string }
-  | { kind: 'backend'; backend: Exclude<BackendId, 'pi'>; model?: string; level?: string }
+  // `gateway` names the configured gateway a `gateway` backend runs against.
+  | { kind: 'backend'; backend: Exclude<BackendId, 'pi'>; model?: string; level?: string; gateway?: string }
+  // A configured role: its targets are tried in order (routing.ts).
+  | { kind: 'role'; role: string; level?: string }
   | { kind: 'error'; error: string }
+
+// The Agent tool's own model names: what `claude/<model>` may name.
+export const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku', 'fable']
+
+// The configured names that `@<name>` can mean besides the backends.
+export type Names = { gateways: ReadonlySet<string>; roles: ReadonlySet<string> }
+
+const NO_NAMES: Names = { gateways: new Set(), roles: new Set() }
 
 export const AGENT_SYNTAX = '`@<agent>[/<model>][:<effort>]`'
 
@@ -727,12 +820,31 @@ function splitModel(rest: string): { model?: string; level?: string } {
 }
 
 // What follows the `@` of a subagent_type, or the default when there is none.
-export function parseRoute(requested: string | undefined, fallback: Route): Route {
+export function parseRoute(requested: string | undefined, fallback: Route, names: Names = NO_NAMES): Route {
   if (requested === undefined || requested === '') return fallback
-  if (requested.toLowerCase() === 'claude') return { kind: 'claude' }
   const head = /^[^/:]*/.exec(requested)![0].toLowerCase()
-  if (!isBackendId(head)) return { kind: 'pi', requested }
   const rest = requested.slice(head.length)
+  if (head === 'claude') {
+    // `claude`, or `claude/<model>`: the Agent tool's own model names.
+    const model = rest.startsWith('/') ? rest.slice(1).toLowerCase() : undefined
+    if (rest && model === undefined) return { kind: 'error', error: `"${requested}": write claude or claude/<${CLAUDE_MODELS.join('|')}>.` }
+    if (model !== undefined && !CLAUDE_MODELS.includes(model)) return { kind: 'error', error: `"${requested}": Claude's models here are ${CLAUDE_MODELS.join(', ')}.` }
+    return model ? { kind: 'claude', model } : { kind: 'claude' }
+  }
+  if (head === 'gateway') return { kind: 'error', error: `"${requested}": name the gateway itself, @<gateway>/<model>${names.gateways.size ? ` (configured: ${[...names.gateways].join(', ')})` : '; none is configured'}.` }
+  if (names.gateways.has(head)) {
+    const { model, level } = splitModel(rest)
+    if (rest.startsWith(':') && !level) return { kind: 'error', error: `"${requested}": after "${head}:" comes a reasoning effort (${levels}); to name a model write ${head}/<model>.` }
+    const problem = model ? modelProblem(model) : undefined
+    if (problem) return { kind: 'error', error: problem }
+    return { kind: 'backend', backend: 'gateway', gateway: head, model, level }
+  }
+  if (names.roles.has(head)) {
+    const { model, level } = splitModel(rest)
+    if (model || (rest && !level)) return { kind: 'error', error: `"${requested}": ${head} is a role, which picks its own agents and models; write @${head}, or @${head}:<effort>.` }
+    return { kind: 'role', role: head, level }
+  }
+  if (!isBackendId(head)) return { kind: 'pi', requested }
   if (head === 'pi') {
     // `pi`, `pi:high` and `pi/<model>` are `default`, `default:high` and the model.
     const { model, level } = splitModel(rest)
@@ -754,8 +866,8 @@ export function defaultRoute(setting: string | undefined, installed: ReadonlySet
   if (!word) return installed.has('pi') ? { kind: 'pi' } : { kind: 'claude' }
   if (word === 'claude' || word === 'native') return { kind: 'claude' }
   if (word === 'pi') return { kind: 'pi' }
-  if (isBackendId(word) && word !== 'pi') return { kind: 'backend', backend: word }
-  return { kind: 'error', error: `PI_SUBAGENT_DEFAULT is "${setting}"; use claude or one of: ${BACKEND_IDS.join(', ')}.` }
+  if (isBackendId(word) && word !== 'pi' && word !== 'gateway') return { kind: 'backend', backend: word }
+  return { kind: 'error', error: `PI_SUBAGENT_DEFAULT is "${setting}"; use claude, one of ${BACKEND_IDS.filter(id => id !== 'gateway').join(', ')}, or a configured role or gateway.` }
 }
 
 export function policyOf(setting: string | undefined): Policy | { error: string } {
@@ -765,12 +877,25 @@ export function policyOf(setting: string | undefined): Policy | { error: string 
   return { error: `PI_SUBAGENT_PERMISSIONS is "${setting}"; use bypass or guarded.` }
 }
 
+// ---- carrying logins across sessions --------------------------------------------------------
+
+// Unpacks each saved login (`AGY_AUTH_B64`, `CODEX_AUTH_B64`: a base64 tar of the CLI's login files
+// under $HOME, as `scripts/auth.sh save` writes it) into $HOME, once per container, never over a
+// file that is there. bash reads the value from its own environment: it never passes through the
+// mod or a command line. Prints one line per login restored.
+export const AUTH_RESTORE_SCRIPT =
+  'st="$HOME/.model-router"; for kind in agy codex; do var="$(printf %s "$kind" | tr a-z A-Z)_AUTH_B64"; v="${!var:-}"; ' +
+  '[ -n "$v" ] || continue; [ -f "$st/restored-$kind" ] && continue; mkdir -p "$st" && chmod 700 "$st"; ' +
+  'if printf %s "$v" | base64 -d 2>/dev/null | tar xzf - -C "$HOME" --skip-old-files 2>/dev/null; then touch "$st/restored-$kind"; echo "restored $kind login from $var"; ' +
+  'else echo "could not unpack $var" >&2; fi; done; true'
+
 // ---- finding what is installed --------------------------------------------------------------
 
-// Prints `<name>\t<path>` for each name that is an executable on PATH.
-export const DETECT_SCRIPT = 'for b in "$@"; do p=$(command -v "$b") && case "$p" in /*) printf "%s\\t%s\\n" "$b" "$p";; esac; done'
+// Prints `<name>\t<path>` for each name that is an executable on PATH. Exits 0 whatever the last
+// name was: a loop's status is its last command's, and a missing last CLI must not void the rest.
+export const DETECT_SCRIPT = 'for b in "$@"; do p=$(command -v "$b") && case "$p" in /*) printf "%s\\t%s\\n" "$b" "$p";; esac; done; exit 0'
 
-export const detectArgv = (): string[] => ['bash', '-c', DETECT_SCRIPT, 'pi-subagent', ...BACKEND_IDS.flatMap(id => BACKENDS[id].bins)]
+export const detectArgv = (): string[] => ['bash', '-c', DETECT_SCRIPT, 'pi-subagent', ...new Set(BACKEND_IDS.flatMap(id => BACKENDS[id].bins))]
 
 // The executable to run for each backend that is installed.
 export function parseDetected(stdout: string): Map<BackendId, string> {
@@ -785,16 +910,21 @@ export function parseDetected(stdout: string): Map<BackendId, string> {
 
 // What the main agent is told about the backends: which are here, how to ask for one, and what happens without an `@`.
 export function backendsNote(installed: ReadonlyMap<BackendId, string>, fallback: Route): string {
-  const here = BACKEND_IDS.filter(id => installed.has(id))
-  const missing = BACKEND_IDS.filter(id => !installed.has(id))
+  // Gateways are named by the user's configuration, and listed with it (routing.ts).
+  const here = BACKEND_IDS.filter(id => id !== 'gateway' && installed.has(id))
+  const missing = BACKEND_IDS.filter(id => id !== 'gateway' && !installed.has(id))
   const where =
     fallback.kind === 'claude'
       ? 'Claude'
       : fallback.kind === 'pi'
         ? 'pi'
         : fallback.kind === 'backend'
-          ? BACKENDS[fallback.backend].title
-          : 'an error: PI_SUBAGENT_DEFAULT is not valid'
+          ? fallback.gateway
+            ? `the ${fallback.gateway} gateway`
+            : BACKENDS[fallback.backend].title
+          : fallback.kind === 'role'
+            ? `the ${fallback.role} role`
+            : 'an error: PI_SUBAGENT_DEFAULT is not valid'
   const rows = here.map(id => `  - \`@${id}\` · ${BACKENDS[id].title}: ${BACKENDS[id].hint}`)
   const other = here.filter(id => id !== 'pi')
   const examples = other.length ? ` (${[`\`Explore@${other[0]}/<model>:high\``, ...(other[1] ? [`\`general-purpose@${other[1]}\``] : [])].join(', ')})` : ''
