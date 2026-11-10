@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { AUTH_RESTORE_SCRIPT, DETECT_SCRIPT, GATEWAY_SHIM } from './backends'
+import { AGY_NOTE, AUTH_RESTORE_SCRIPT, DETECT_SCRIPT, GATEWAY_SHIM } from './backends'
 import { ENV_SET_SCRIPT } from './routing'
 import { READ_ONLY_NOTE_ANY } from './core'
 
@@ -1031,7 +1031,7 @@ test('agy: the prompt is the value of its flag and no file is written; the conve
   const spawn = w.spawns[0]!
   expect(modeOf(spawn.argv)).toBe('none')
   expect(cliOf(spawn.argv)).toEqual([
-    'agy', '--output-format=stream-json', '--model=Gemini 3.8 Flash (High)', '--dangerously-skip-permissions', '--prompt=do the task',
+    'agy', '--output-format=stream-json', '--model=Gemini 3.8 Flash (High)', '--dangerously-skip-permissions', `--prompt=${AGY_NOTE}\n\ndo the task`,
   ])
   expect(w.writes.has(promptFileOf(w))).toBe(false)
   expect(w.runs.some(a => a[0] === 'rm')).toBe(false)
@@ -1073,7 +1073,7 @@ test('a prompt too long for a command line goes in a file the CLI is told to rea
   const prompt = cliOf(w.spawns[0]!.argv).at(-1)!
   expect(prompt.length).toBeLessThan(500)
   expect(prompt).toContain(promptFileOf(w))
-  expect(w.writes.get(promptFileOf(w))).toBe(`${long}\n`)
+  expect(w.writes.get(promptFileOf(w))).toBe(`${AGY_NOTE}\n\n${long}\n`)
   expect(w.runs).toContainEqual(['rm', '-f', promptFileOf(w)])
 })
 

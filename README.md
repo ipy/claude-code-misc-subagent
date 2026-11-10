@@ -45,7 +45,7 @@ You rarely write this by hand: the Agent tool's description lists the agents ins
 | `claude-code` | Claude Code 2.1.x | stdin | `--resume` | only `Read,Grep,Glob,LS` |
 | `codex` | Codex CLI 0.135 | stdin | `codex exec resume <thread>` | `read-only` sandbox |
 | `codebuddy-code` | CodeBuddy Code 2.181 | stdin | `--resume` | only `Read,Grep,Glob,LS` |
-| `agy` | agy 1.5.3 | `--prompt=` argument | `--conversation` | `write_file(*)`, `command(*)` and `mcp(*)` denied for the run (`--settings`): headless agy refuses commands by itself but writes files without asking |
+| `agy` | agy 1.5.3 | `--prompt=` argument | `--conversation` | its file-writing and MCP tools denied for the run (`--settings`); its shell stays, as Claude Code's own Explore keeps Bash (agy's rules cannot limit commands to read-only ones, and without them it cannot list a folder) |
 | gateways | Claude Code 2.1.x | stdin | `--resume` | only `Read,Grep,Glob,LS` |
 | `opencode` | opencode 1.15.10 | argument after `--` | `--session` | `bash` and `edit` denied for the run (`OPENCODE_PERMISSION`) |
 

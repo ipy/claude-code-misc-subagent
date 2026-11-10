@@ -108,6 +108,8 @@ export type Backend = {
   persistent: boolean
   // Whether the CLI takes the read-only note as an addition to its system prompt (otherwise it leads the prompt).
   systemNote: boolean
+  // A line that leads every prompt to this CLI.
+  promptNote?: string
   // What the main agent is told about naming a model.
   hint: string
   // The CLI's own value for a reasoning level, or none.
@@ -560,7 +562,8 @@ const flag = (name: string, value?: string) => (value ? [`${name}=${value}`] : [
 // a backend that cannot be given a system prompt is told its mode in the prompt.
 export function promptFor(b: Backend, l: Pick<Launch, 'prompt' | 'readOnly'>): string {
   const body = l.prompt.startsWith('/') ? `Task:\n${l.prompt}` : l.prompt
-  return l.readOnly && !b.systemNote ? `${READ_ONLY_NOTE_ANY}\n\n${body}` : body
+  const lead = [l.readOnly && !b.systemNote ? READ_ONLY_NOTE_ANY : '', b.promptNote ?? ''].filter(Boolean).join(' ')
+  return lead ? `${lead}\n\n${body}` : body
 }
 
 // The backend's value for the launch's reasoning level, if it has one.
@@ -586,7 +589,16 @@ function claudeLikeArgv(l: Launch, bypass: string, effort: string | undefined): 
 }
 
 // agy's session-only settings for a read-only run: its permission rules, deny over everything else.
-export const AGY_READ_ONLY_SETTINGS = JSON.stringify({ permissions: { deny: ['write_file(*)', 'command(*)', 'mcp(*)'] } })
+// agy 1.5.3, verified: headless agy writes files without asking; a request no rule covers ends the
+// whole run ("headless mode cannot prompt"); deny wins over allow; and a command rule matches only
+// as a catch-all, so shell commands cannot be limited to read-only ones. With commands denied agy
+// cannot even list a directory, so a read-only agy keeps its shell, as Claude Code's own Explore
+// agent keeps Bash: its file-writing and MCP tools are denied, and it is told it is read-only.
+export const AGY_READ_ONLY_SETTINGS = JSON.stringify({ permissions: { deny: ['write_file(*)', 'mcp(*)'] } })
+
+// Headless agy may hand a task to a background subagent of its own and end its turn on "waiting for
+// the subagent": the answer would be that. It is told to do the work itself.
+export const AGY_NOTE = 'Do the work yourself in this run: do not start or delegate to subagents or background tasks, and do not end your turn before you have the answer.'
 
 // Starts Claude Code against a gateway. The base URL and key are read from the variables the
 // gateway names here, in the CLI's own shell, so neither is on a command line (`ps`) or in what
@@ -726,6 +738,7 @@ export const BACKENDS: Record<BackendId, Backend> = {
     steers: false,
     persistent: false,
     systemNote: false,
+    promptNote: AGY_NOTE,
     hint: 'a model id from `agy models` in Bash, such as `gemini-3.8-flash-high`',
     effort: level => (level === 'off' ? undefined : level === 'minimal' ? 'low' : level),
     argv: l => [
@@ -734,11 +747,11 @@ export const BACKENDS: Record<BackendId, Backend> = {
       ...flag('--conversation', l.session),
       ...flag('--model', l.model),
       ...flag('--effort', effortOf(BACKENDS.agy, l)),
-      // Read-only: headless agy refuses commands by itself but writes files freely (seen with
-      // agy 1.5.3), so writes, commands and MCP tools are denied for this run; reads stay allowed.
+      // Read-only: its file-writing and MCP tools denied (see AGY_READ_ONLY_SETTINGS), its commands
+      // approved, as a request nothing approves would end the run.
       ...(l.readOnly ? [`--settings=${AGY_READ_ONLY_SETTINGS}`] : []),
       // Without the flag agy's headless mode refuses what needs approval (commands); file writes do not need it.
-      ...(!l.readOnly && l.policy === 'bypass' ? ['--dangerously-skip-permissions'] : []),
+      ...(l.readOnly || l.policy === 'bypass' ? ['--dangerously-skip-permissions'] : []),
       `--prompt=${l.prompt}`,
     ],
     parser: agyParser,

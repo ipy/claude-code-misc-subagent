@@ -9,6 +9,7 @@ import {
   type Parser,
   type Gateway,
   type Route,
+  AGY_NOTE,
   AGY_READ_ONLY_SETTINGS,
   AUTH_RESTORE_SCRIPT,
   GATEWAY_SHIM,
@@ -299,19 +300,21 @@ test('codex: a resume names the thread after the flags, a model and effort are o
   expect(argv('codex').some(a => a.startsWith('model_reasoning_effort'))).toBe(false)
 })
 
-test('agy: the prompt is one argument bound to its flag, writes need the bypass flag it only gets unattended', () => {
+test('agy: the prompt is one argument bound to its flag; read-only denies its writing tools and keeps its shell', () => {
   const fresh = argv('agy')
   expect(fresh).toEqual(['agy', '--output-format=stream-json', '--dangerously-skip-permissions', '--prompt=the task'])
   const resumed = argv('agy', { session: 'conv-1', model: 'Gemini 3.8 Flash (High)', effort: 'minimal' })
   expect(value(resumed, '--conversation')).toBe('conv-1')
   expect(value(resumed, '--model')).toBe('Gemini 3.8 Flash (High)')
   expect(value(resumed, '--effort')).toBe('low')
-  // Without the flag agy's headless mode refuses what needs approval: guarded and read-only.
+  // Guarded: no flag, so headless agy refuses what needs approval.
   expect(argv('agy', { policy: 'guarded' })).not.toContain('--dangerously-skip-permissions')
-  expect(argv('agy', { readOnly: true })).not.toContain('--dangerously-skip-permissions')
-  // Headless agy writes files without asking, so read-only denies writes, commands and MCP tools by rule.
+  // Read-only, whatever the policy: file-writing and MCP tools denied by rule, commands approved
+  // (a request nothing approves would end agy's run, and without commands it cannot even list a folder).
   for (const policy of ['bypass', 'guarded'] as const) {
-    expect(JSON.parse(value(argv('agy', { readOnly: true, policy }), '--settings')!)).toEqual({ permissions: { deny: ['write_file(*)', 'command(*)', 'mcp(*)'] } })
+    const ro = argv('agy', { readOnly: true, policy })
+    expect(JSON.parse(value(ro, '--settings')!)).toEqual({ permissions: { deny: ['write_file(*)', 'mcp(*)'] } })
+    expect(ro).toContain('--dangerously-skip-permissions')
   }
   expect(AGY_READ_ONLY_SETTINGS).toContain('write_file(*)')
   expect(argv('agy').some(a => a.startsWith('--settings'))).toBe(false)
@@ -856,4 +859,11 @@ test('the login restore unpacks saved logins once, never over existing files, an
   expect(AUTH_RESTORE_SCRIPT).toContain('restored-$kind')
   expect(AUTH_RESTORE_SCRIPT).toContain('for kind in agy codex')
   expect(AUTH_RESTORE_SCRIPT).not.toMatch(/echo[^;]*\$v\b/)
+})
+
+test('agy is told to do the work itself; read-only leads with the read-only note', () => {
+  expect(promptFor(BACKENDS.agy, { prompt: 'task', readOnly: false })).toBe(`${AGY_NOTE}\n\ntask`)
+  expect(promptFor(BACKENDS.agy, { prompt: 'task', readOnly: true })).toBe(`${READ_ONLY_NOTE_ANY} ${AGY_NOTE}\n\ntask`)
+  expect(AGY_NOTE).toContain('do not start or delegate to subagents')
+  expect(promptFor(BACKENDS.codex, { prompt: 'task', readOnly: false })).toBe('task')
 })
