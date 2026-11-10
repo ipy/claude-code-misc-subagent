@@ -1,6 +1,6 @@
 // The user's gateways and roles, and how a role picks its agent. Pure: no `$`.
 //
-// Configuration comes from `~/.claude/pi-subagent/config.json` and the PI_SUBAGENT_CONFIG
+// Configuration comes from `~/.claude/polyagent/config.json` and the POLYAGENT_CONFIG
 // variable (JSON, or the path of a JSON file), the variable's entries over the file's:
 //
 //   {
@@ -36,7 +36,9 @@ export type Config = {
 
 export type Source = { origin: string; text: string }
 
-export const CONFIG_FILE = '.claude/pi-subagent/config.json'
+export const CONFIG_FILE = '.claude/polyagent/config.json'
+// Where the configuration was before the project was Polyagent: read while the new file does not exist.
+export const LEGACY_CONFIG_FILE = '.claude/pi-subagent/config.json'
 
 const NAME = /^[a-z][a-z0-9_-]{0,31}$/
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/
@@ -135,7 +137,7 @@ export function parseConfig(sources: readonly Source[]): Config {
 
 export const namesOf = (cfg: Config): Names => ({ gateways: new Set(cfg.gateways.keys()), roles: new Set(cfg.roles.keys()) })
 
-// PI_SUBAGENT_CONFIG holds JSON itself, or names a file that does.
+// POLYAGENT_CONFIG holds JSON itself, or names a file that does.
 export const configIsInline = (value: string) => value.trimStart().startsWith('{')
 
 // The variables a gateway needs set, for `envSetArgv`.
@@ -144,7 +146,7 @@ export const gatewayVars = (g: Gateway): string[] => [g.baseUrlEnv, g.keyEnv].fi
 // Prints the name of each variable given that is set and not empty. Values are never printed.
 export const ENV_SET_SCRIPT = 'for v in "$@"; do [ -n "${!v:-}" ] && printf "%s\\n" "$v"; done; exit 0'
 
-export const envSetArgv = (vars: readonly string[]): string[] => ['bash', '-c', ENV_SET_SCRIPT, 'pi-subagent', ...vars]
+export const envSetArgv = (vars: readonly string[]): string[] => ['bash', '-c', ENV_SET_SCRIPT, 'polyagent', ...vars]
 
 // ---- what a target is, and whether it can be used --------------------------------------------
 
@@ -223,7 +225,7 @@ export function routingNote(cfg: Config, gateways: readonly GatewayState[], role
       lines.push(`  - \`@${role.name}\`${type}: ${chain}${skipped}${role.description ? `. ${role.description}` : ''}`)
     }
   }
-  if (cfg.problems.length) lines.push(`- pi-subagent configuration problems: ${cfg.problems.join(' | ')}`)
+  if (cfg.problems.length) lines.push(`- polyagent configuration problems: ${cfg.problems.join(' | ')}`)
   return lines.join('\n')
 }
 

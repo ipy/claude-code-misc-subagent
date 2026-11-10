@@ -54,7 +54,7 @@ test('read-only types are case-insensitive', () => {
 test('piArgv: wrapper, session, model, thinking, read-only', () => {
   const plain = piArgv({ cmdFile: '/c', session: ['--session-dir', '/d', '--session-id', 'x'], readOnly: false })
   expect(plain.slice(0, 2)).toEqual(['bash', '-c'])
-  expect(plain.slice(3)).toEqual(['pi-subagent', 'feed', '/c', 'pi', '--mode', 'rpc', '--session-dir', '/d', '--session-id', 'x'])
+  expect(plain.slice(3)).toEqual(['polyagent', 'feed', '/c', 'pi', '--mode', 'rpc', '--session-dir', '/d', '--session-id', 'x'])
   const full = piArgv({ cmdFile: '/c', session: ['--session', '/s.jsonl'], readOnly: true, model: 'p/m', thinking: 'high' })
   expect(full.slice(6)).toEqual([
     'pi', '--mode', 'rpc', '--session', '/s.jsonl', '--model', 'p/m', '--thinking', 'high',
@@ -330,13 +330,13 @@ test('wrapArgv: the CLI after the mode and file, its stdin the feeder, the file 
   for (const mode of ['feed', 'file', 'none'] as const) {
     const argv = wrapArgv(mode, '/p', cli)
     expect(argv.slice(0, 2)).toEqual(['bash', '-c'])
-    expect(argv.slice(3)).toEqual(['pi-subagent', mode, '/p', ...cli])
+    expect(argv.slice(3)).toEqual(['polyagent', mode, '/p', ...cli])
   }
   const script = wrapArgv('none', '/p', cli)[2] ?? ''
   // Only what stock macOS has: BSD tail has no --pid, and bash 3.2 has no `wait -n`.
   expect(script).not.toContain('tail')
   expect(script).not.toContain('wait -n')
-  expect(script).toContain('export PI_SUBAGENT_NESTED=1')
+  expect(script).toContain('export POLYAGENT_NESTED=1')
   expect(script).toContain('feed) exec "$@" < <(')
   expect(script).toContain('file) exec "$@" < "$f"')
   expect(script).toContain('exec "$@" < /dev/null')

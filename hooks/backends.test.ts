@@ -141,7 +141,7 @@ test('defaultRoute: pi when it is installed, else Claude, unless the setting nam
   expect(defaultRoute('gateway', none).kind).toBe('error')
   const bad = defaultRoute('gemini', withPi)
   expect(bad.kind).toBe('error')
-  expect((bad as { error: string }).error).toContain('PI_SUBAGENT_DEFAULT is "gemini"')
+  expect((bad as { error: string }).error).toContain('POLYAGENT_DEFAULT is "gemini"')
 })
 
 test('policyOf: unattended unless guarded is asked for; anything else is an error', () => {
@@ -149,14 +149,14 @@ test('policyOf: unattended unless guarded is asked for; anything else is an erro
   expect(policyOf('')).toBe('bypass')
   expect(policyOf('bypass')).toBe('bypass')
   expect(policyOf(' Guarded ')).toBe('guarded')
-  expect(policyOf('yolo')).toEqual({ error: 'PI_SUBAGENT_PERMISSIONS is "yolo"; use bypass or guarded.' })
+  expect(policyOf('yolo')).toEqual({ error: 'POLYAGENT_PERMISSIONS is "yolo"; use bypass or guarded.' })
 })
 
 // ---- what is installed ----------------------------------------------------------------------
 
 test('detectArgv asks bash for every executable name once, parseDetected reads the answer', () => {
   const argv = detectArgv()
-  expect(argv.slice(0, 4)).toEqual(['bash', '-c', DETECT_SCRIPT, 'pi-subagent'])
+  expect(argv.slice(0, 4)).toEqual(['bash', '-c', DETECT_SCRIPT, 'polyagent'])
   // Each name once: a gateway runs the same claude as claude-code.
   expect(argv.slice(4)).toEqual(['pi', 'claude', 'codex', 'codebuddy-code', 'codebuddy', 'cbc', 'agy', 'opencode'])
   // Only absolute paths count: a shell function or alias of the same name is not an executable.
@@ -195,7 +195,7 @@ test('backendsNote lists what is here with how to name a model, what is missing,
   expect(note).toContain('`Explore@codex/<model>:high`')
   expect(backendsNote(here, { kind: 'claude' })).toContain('Without an `@`, the agent runs on Claude.')
   expect(backendsNote(here, { kind: 'backend', backend: 'codex' })).toContain('runs on Codex CLI.')
-  expect(backendsNote(here, { kind: 'error', error: 'x' })).toContain('PI_SUBAGENT_DEFAULT is not valid')
+  expect(backendsNote(here, { kind: 'error', error: 'x' })).toContain('POLYAGENT_DEFAULT is not valid')
   const all = new Map(BACKEND_IDS.map(id => [id, BACKENDS[id].bins[0]!] as const))
   expect(backendsNote(all, PI)).not.toContain('Not installed')
   expect(backendsNote(new Map(), { kind: 'claude' })).toContain('None of the supported agent CLIs is installed here')
@@ -750,7 +750,7 @@ const SHIM_ARGS = 4
 
 test('gateway: Claude Code started through the shim, which reads the URL and key from the variables the gateway names', () => {
   const a = argv('gateway', { model: 'coding', gateway: GW })
-  expect(a.slice(0, 4)).toEqual(['bash', '-c', GATEWAY_SHIM, 'pi-subagent-gateway'])
+  expect(a.slice(0, 4)).toEqual(['bash', '-c', GATEWAY_SHIM, 'polyagent-gateway'])
   // <base url> <base url variable> <key variable> <variable for the key>
   expect(a.slice(4, 4 + SHIM_ARGS)).toEqual(['', 'MYGW_BASE_URL', 'MYGW_API_KEY', 'ANTHROPIC_API_KEY'])
   expect(a.slice(8)).toEqual([

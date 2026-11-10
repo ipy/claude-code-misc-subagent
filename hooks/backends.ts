@@ -625,7 +625,7 @@ function gatewayArgv(l: Launch, effort: string | undefined): string[] {
     'bash',
     '-c',
     GATEWAY_SHIM,
-    'pi-subagent-gateway',
+    'polyagent-gateway',
     g.baseUrl ?? '',
     g.baseUrlEnv ?? '',
     g.keyEnv ?? '',
@@ -873,21 +873,21 @@ export function parseRoute(requested: string | undefined, fallback: Route, names
 }
 
 // The default for an Agent call with no `@`: pi when it is installed, else Claude; or what
-// PI_SUBAGENT_DEFAULT names.
+// POLYAGENT_DEFAULT names.
 export function defaultRoute(setting: string | undefined, installed: ReadonlySet<BackendId>): Route {
   const word = (setting ?? '').trim().toLowerCase()
   if (!word) return installed.has('pi') ? { kind: 'pi' } : { kind: 'claude' }
   if (word === 'claude' || word === 'native') return { kind: 'claude' }
   if (word === 'pi') return { kind: 'pi' }
   if (isBackendId(word) && word !== 'pi' && word !== 'gateway') return { kind: 'backend', backend: word }
-  return { kind: 'error', error: `PI_SUBAGENT_DEFAULT is "${setting}"; use claude, one of ${BACKEND_IDS.filter(id => id !== 'gateway').join(', ')}, or a configured role or gateway.` }
+  return { kind: 'error', error: `POLYAGENT_DEFAULT is "${setting}"; use claude, one of ${BACKEND_IDS.filter(id => id !== 'gateway').join(', ')}, or a configured role or gateway.` }
 }
 
 export function policyOf(setting: string | undefined): Policy | { error: string } {
   const word = (setting ?? '').trim().toLowerCase()
   if (word === '' || word === 'bypass') return 'bypass'
   if (word === 'guarded') return 'guarded'
-  return { error: `PI_SUBAGENT_PERMISSIONS is "${setting}"; use bypass or guarded.` }
+  return { error: `POLYAGENT_PERMISSIONS is "${setting}"; use bypass or guarded.` }
 }
 
 // ---- carrying logins across sessions --------------------------------------------------------
@@ -908,7 +908,7 @@ export const AUTH_RESTORE_SCRIPT =
 // name was: a loop's status is its last command's, and a missing last CLI must not void the rest.
 export const DETECT_SCRIPT = 'for b in "$@"; do p=$(command -v "$b") && case "$p" in /*) printf "%s\\t%s\\n" "$b" "$p";; esac; done; exit 0'
 
-export const detectArgv = (): string[] => ['bash', '-c', DETECT_SCRIPT, 'pi-subagent', ...new Set(BACKEND_IDS.flatMap(id => BACKENDS[id].bins))]
+export const detectArgv = (): string[] => ['bash', '-c', DETECT_SCRIPT, 'polyagent', ...new Set(BACKEND_IDS.flatMap(id => BACKENDS[id].bins))]
 
 // The executable to run for each backend that is installed.
 export function parseDetected(stdout: string): Map<BackendId, string> {
@@ -937,7 +937,7 @@ export function backendsNote(installed: ReadonlyMap<BackendId, string>, fallback
             : BACKENDS[fallback.backend].title
           : fallback.kind === 'role'
             ? `the ${fallback.role} role`
-            : 'an error: PI_SUBAGENT_DEFAULT is not valid'
+            : 'an error: POLYAGENT_DEFAULT is not valid'
   const rows = here.map(id => `  - \`@${id}\` · ${BACKENDS[id].title}: ${BACKENDS[id].hint}`)
   const other = here.filter(id => id !== 'pi')
   const examples = other.length ? ` (${[`\`Explore@${other[0]}/<model>:high\``, ...(other[1] ? [`\`general-purpose@${other[1]}\``] : [])].join(', ')})` : ''
